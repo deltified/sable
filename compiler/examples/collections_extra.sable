@@ -1,0 +1,48 @@
+fn main() -> i32
+    effects(alloc)
+{
+    let total = 0s
+
+    let text = "Sable"
+    for ch in text {
+        total += ch
+    }
+
+    let values: vec<i32> = vec.new()
+    values = vec.push(values, 10s)
+    values = vec.push(values, 20s)
+    values = vec.push(values, 30s)
+
+    for value in values {
+        total += value
+    }
+
+    values = vec.remove(values, 1)
+    let values_len = vec.len(values)
+    values = vec.clear(values)
+
+    let m: map<str, i32> = map.new()
+    m = map.put(m, "a", 1s)
+    m = map.remove(m, "a")
+    m = map.clear(m)
+
+    let om: ordered_map<str, i32> = ordered_map.new()
+    om = ordered_map.put(om, "left", 1s)
+    om = ordered_map.remove(om, "left")
+    om = ordered_map.clear(om)
+
+    if vec.is_empty(values) {
+        total += 2s
+    }
+    if map.is_empty(m) {
+        total += 4s
+    }
+    if ordered_map.is_empty(om) {
+        total += 8s
+    }
+    if values_len == 2 {
+        total += 16s
+    }
+
+    return total
+}

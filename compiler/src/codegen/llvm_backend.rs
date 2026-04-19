@@ -53,6 +53,7 @@ struct LocalValue<'ctx> {
 struct FunctionContext<'ctx> {
     alloca_builder: Builder<'ctx>,
     locals: BTreeMap<String, LocalValue<'ctx>>,
+    local_sable_types: BTreeMap<String, Type>,
     blocks: Vec<BasicBlock<'ctx>>,
 }
 
@@ -156,6 +157,7 @@ impl<'ctx> Codegen<'ctx> {
         let mut function_ctx = FunctionContext {
             alloca_builder: self.context.create_builder(),
             locals: BTreeMap::new(),
+            local_sable_types: BTreeMap::new(),
             blocks: mir_blocks,
         };
 
@@ -235,7 +237,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             MirInstructionKind::Call { callee, args } => {
-                let call_result = self.emit_call(function_ctx, callee, args)?;
+                let call_result = self.emit_call(function_ctx, callee, args, &instruction.ty)?;
                 if let (Some(dest), Some(value)) = (&instruction.dest, call_result) {
                     self.store_to_local(function_ctx, dest, &instruction.ty, value)?;
                 }
@@ -318,15 +320,25 @@ impl<'ctx> Codegen<'ctx> {
             BasicValueEnum::IntValue(int) => int,
             _ => bail!("index operand must lower to an integer value"),
         };
-        let index_i32 = self.to_i32_index(index_int)?;
 
-        let array_ptr = match base {
-            MirOperand::Local(name) => {
-                let local = function_ctx
-                    .locals
-                    .get(name)
-                    .ok_or_else(|| anyhow!("index base local '{}' not found", name))?;
+        let MirOperand::Local(name) = base else {
+            bail!("index load currently requires a local variable base")
+        };
 
+        let local = *function_ctx
+            .locals
+            .get(name)
+            .ok_or_else(|| anyhow!("index base local '{}' not found", name))?;
+        let base_sable_ty = function_ctx
+            .local_sable_types
+            .get(name)
+            .ok_or_else(|| anyhow!("index base local '{}' is missing Sable type metadata", name))?;
+
+        match base_sable_ty {
+            Type::Array {
+                inner: _,
+                size: Some(_),
+            } => {
                 let array_ty = match local.ty {
                     BasicTypeEnum::ArrayType(array_ty) => array_ty,
                     _ => {
@@ -338,19 +350,57 @@ impl<'ctx> Codegen<'ctx> {
                     }
                 };
 
+                let index_i32 = self.to_i32_index(index_int)?;
                 let zero = self.context.i32_type().const_zero();
-                unsafe {
+                let array_ptr = unsafe {
                     self.builder
                         .build_gep(array_ty, local.ptr, &[zero, index_i32], "idx.ptr")
                         .map_err(|e| anyhow!("failed to build array index GEP: {e}"))?
-                }
-            }
-            _ => bail!("index load currently requires a local variable base"),
-        };
+                };
 
-        self.builder
-            .build_load(element_ty, array_ptr, "idx.load")
-            .map_err(|e| anyhow!("failed to load indexed element: {e}"))
+                self.builder
+                    .build_load(element_ty, array_ptr, "idx.load")
+                    .map_err(|e| anyhow!("failed to load indexed element: {e}"))
+            }
+            Type::Str | Type::Vec(_) => {
+                let base_value = self
+                    .builder
+                    .build_load(local.ty, local.ptr, "idx.base")
+                    .map_err(|e| anyhow!("failed to load dynamic index base '{}': {e}", name))?;
+                let base_value_ty = base_value.get_type();
+                let index_value_ty = index_int.get_type().as_basic_type_enum();
+
+                let symbol = match base_sable_ty {
+                    Type::Str => "str_index",
+                    Type::Vec(_) => "vec_get",
+                    _ => unreachable!(),
+                };
+                let runtime_fn = self.ensure_runtime_builtin(
+                    symbol,
+                    Some(element_ty),
+                    &[base_value_ty, index_value_ty],
+                );
+
+                let call_site = self
+                    .builder
+                    .build_call(
+                        runtime_fn,
+                        &[base_value.into(), index_int.into()],
+                        "idx.runtime",
+                    )
+                    .map_err(|e| anyhow!("failed to emit dynamic index load call: {e}"))?;
+
+                call_site
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| anyhow!("dynamic index builtin did not return a value"))
+            }
+            _ => bail!(
+                "index load base '{}' has unsupported type {:?}",
+                name,
+                base_sable_ty
+            ),
+        }
     }
 
     fn to_i32_index(&self, value: IntValue<'ctx>) -> Result<IntValue<'ctx>> {
@@ -395,10 +445,15 @@ impl<'ctx> Codegen<'ctx> {
         function_ctx: &mut FunctionContext<'ctx>,
         callee: &str,
         args: &[MirOperand],
+        result_ty: &Type,
     ) -> Result<Option<BasicValueEnum<'ctx>>> {
         if callee == "io.out" {
             self.emit_io_out_builtin(function_ctx, args)?;
             return Ok(None);
+        }
+
+        if callee.contains('.') {
+            return self.emit_runtime_builtin_call(function_ctx, callee, args, result_ty);
         }
 
         let function = *self
@@ -434,6 +489,37 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Result<()> {
         if args.len() != 1 {
             bail!("io.out currently expects exactly one argument");
+        }
+
+        let arg_sable_ty = match &args[0] {
+            MirOperand::Local(name) => function_ctx.local_sable_types.get(name).cloned(),
+            MirOperand::Const(MirConst::Str(_)) => Some(Type::Str),
+            MirOperand::Const(MirConst::Bool(_)) => Some(Type::Bool),
+            MirOperand::Const(MirConst::Int(_, ty)) => Some(ty.clone()),
+            MirOperand::Const(MirConst::Float(_, ty)) => Some(ty.clone()),
+        };
+
+        if matches!(arg_sable_ty, Some(Type::Str)) {
+            let raw = self.lower_operand(function_ctx, &args[0])?;
+            let str_fn = self.ensure_runtime_builtin("io_out_str", None, &[raw.get_type()]);
+            self.builder
+                .build_call(str_fn, &[raw.into()], "io.out.str")
+                .map_err(|e| anyhow!("failed to emit io.out(str): {e}"))?;
+            return Ok(());
+        }
+
+        if matches!(arg_sable_ty, Some(Type::Bool)) {
+            let raw = self.lower_operand(function_ctx, &args[0])?;
+            let bool_value = self.to_bool(raw)?;
+            let bool_fn = self.ensure_runtime_builtin(
+                "io_out_bool",
+                None,
+                &[bool_value.get_type().as_basic_type_enum()],
+            );
+            self.builder
+                .build_call(bool_fn, &[bool_value.into()], "io.out.bool")
+                .map_err(|e| anyhow!("failed to emit io.out(bool): {e}"))?;
+            return Ok(());
         }
 
         let raw = self.lower_operand(function_ctx, &args[0])?;
@@ -474,6 +560,118 @@ impl<'ctx> Codegen<'ctx> {
             .map_err(|e| anyhow!("failed to emit io.out call: {e}"))?;
 
         Ok(())
+    }
+
+    fn emit_runtime_builtin_call(
+        &mut self,
+        function_ctx: &mut FunctionContext<'ctx>,
+        callee: &str,
+        args: &[MirOperand],
+        result_ty: &Type,
+    ) -> Result<Option<BasicValueEnum<'ctx>>> {
+        let mut lowered_args = Vec::with_capacity(args.len());
+        let mut arg_types = Vec::with_capacity(args.len());
+
+        for arg in args {
+            let value = self.lower_operand(function_ctx, arg)?;
+            arg_types.push(value.get_type());
+            lowered_args.push(value);
+        }
+
+        let return_ty = if *result_ty == Type::Void {
+            None
+        } else {
+            Some(self.llvm_basic_type(result_ty).ok_or_else(|| {
+                anyhow!(
+                    "unsupported runtime builtin return type {:?} for '{}'",
+                    result_ty,
+                    callee
+                )
+            })?)
+        };
+
+        let runtime_fn = self.ensure_runtime_builtin(
+            &callee.replace('.', "_"),
+            return_ty,
+            &arg_types,
+        );
+
+        let call_args = lowered_args
+            .iter()
+            .map(|value| BasicMetadataValueEnum::from(*value))
+            .collect::<Vec<_>>();
+
+        let call_site = self
+            .builder
+            .build_call(runtime_fn, &call_args, "rt.call")
+            .map_err(|e| anyhow!("failed to emit runtime builtin call '{}': {e}", callee))?;
+
+        if return_ty.is_some() {
+            call_site
+                .try_as_basic_value()
+                .basic()
+                .map(Some)
+                .ok_or_else(|| anyhow!("runtime builtin '{}' did not return a value", callee))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn ensure_runtime_builtin(
+        &mut self,
+        name: &str,
+        return_ty: Option<BasicTypeEnum<'ctx>>,
+        arg_tys: &[BasicTypeEnum<'ctx>],
+    ) -> FunctionValue<'ctx> {
+        let symbol = self.runtime_builtin_symbol(name, return_ty, arg_tys);
+        if let Some(existing) = self.module.get_function(&symbol) {
+            return existing;
+        }
+
+        let args = arg_tys
+            .iter()
+            .map(|ty| (*ty).into())
+            .collect::<Vec<_>>();
+        let fn_ty = match return_ty {
+            Some(ret) => ret.fn_type(&args, false),
+            None => self.context.void_type().fn_type(&args, false),
+        };
+
+        self.module.add_function(&symbol, fn_ty, None)
+    }
+
+    fn runtime_builtin_symbol(
+        &self,
+        name: &str,
+        return_ty: Option<BasicTypeEnum<'ctx>>,
+        arg_tys: &[BasicTypeEnum<'ctx>],
+    ) -> String {
+        let args_sig = if arg_tys.is_empty() {
+            "none".to_string()
+        } else {
+            arg_tys
+                .iter()
+                .map(|ty| self.mangle_runtime_type(*ty))
+                .collect::<Vec<_>>()
+                .join("_")
+        };
+        let ret_sig = return_ty
+            .map(|ty| self.mangle_runtime_type(ty))
+            .unwrap_or_else(|| "void".to_string());
+
+        format!("__sable_rt_{name}__{args_sig}__{ret_sig}")
+    }
+
+    fn mangle_runtime_type(&self, ty: BasicTypeEnum<'ctx>) -> String {
+        match ty {
+            BasicTypeEnum::IntType(int_ty) => format!("i{}", int_ty.get_bit_width()),
+            BasicTypeEnum::FloatType(float_ty) => format!("f{}", float_ty.get_bit_width()),
+            BasicTypeEnum::PointerType(_) => "ptr".to_string(),
+            BasicTypeEnum::ArrayType(_) => "arr".to_string(),
+            BasicTypeEnum::StructType(_) => "struct".to_string(),
+            BasicTypeEnum::VectorType(_) => "vec".to_string(),
+            _ => "ty".to_string(),
+        }
     }
 
     fn emit_terminator(
@@ -560,7 +758,13 @@ impl<'ctx> Codegen<'ctx> {
                 .bool_type()
                 .const_int(u64::from(*value), false)
                 .into()),
-            MirConst::Str(_) => bail!("string constant codegen is not implemented yet"),
+            MirConst::Str(value) => {
+                let global = self
+                    .builder
+                    .build_global_string_ptr(value, "str.lit")
+                    .map_err(|e| anyhow!("failed to lower string constant: {e}"))?;
+                Ok(global.as_pointer_value().into())
+            }
         }
     }
 
@@ -572,6 +776,9 @@ impl<'ctx> Codegen<'ctx> {
         value: BasicValueEnum<'ctx>,
     ) -> Result<()> {
         let local = self.ensure_local(function_ctx, name, ty)?;
+        function_ctx
+            .local_sable_types
+            .insert(name.to_string(), ty.clone());
         self.builder
             .build_store(local.ptr, value)
             .map_err(|e| anyhow!("failed to store local '{}': {e}", name))?;
@@ -805,6 +1012,11 @@ impl<'ctx> Codegen<'ctx> {
             Type::U32 => self.context.i32_type().into(),
             Type::F64 => self.context.f64_type().into(),
             Type::F32 => self.context.f32_type().into(),
+            Type::Str
+            | Type::Vec(_)
+            | Type::Map(_, _)
+            | Type::OrderedMap(_, _)
+            | Type::Unknown => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Named(name) => self.struct_types.get(name).copied()?.as_basic_type_enum(),
             Type::Ref { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Array {

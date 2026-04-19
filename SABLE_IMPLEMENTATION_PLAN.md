@@ -19,14 +19,17 @@
 - C1-WP15 (vector baseline): implemented in bootstrap form with generic `vec<T>` type syntax and runtime builtins (`new`, `with_capacity`, `push`, `get`, `len`).
 - C1-WP16 (ordered_map baseline): implemented in bootstrap form with `ordered_map<K,V>` syntax and runtime builtins (`new`, `put`, `get`, `contains`, `len`).
 - C1-WP17 (hash map baseline): implemented in bootstrap form with `map<K,V>` syntax and runtime builtins (`new`, `with_capacity`, `put`, `get`, `contains`, `len`) backed by fast hashing.
+- C1 collection API expansion (bootstrap): added `remove`, `clear`, and `is_empty` across `vec<T>`, `map<K,V>`, and `ordered_map<K,V>` in sema, MIR, runtime, and LLVM IR lowering.
+- C1 for-loop coverage expansion (bootstrap): `for` lowering now supports fixed arrays, ranges, `vec<T>`, and `str` with canonical index-based MIR form.
+- C1 inference refinement (bootstrap): constructor-based local generic inference now propagates through plain assignments (`=`) for collection locals.
 - C1-WP21 and C1-WP22: implemented as typed CFG MIR with canonical lowering and baseline optimization passes.
-- LLVM backend status: working on Windows for supported subset behind `llvm-backend`, including `IndexLoad` and `MemberLoad`.
+- LLVM backend status: working on Windows for supported subset behind `llvm-backend`, including `IndexLoad`/`MemberLoad` plus runtime-backed string/collection builtin call lowering.
 - New bootstrap execution path: MIR interpreter (`run` command) supports end-to-end execution for current subset.
 - Deterministic-ready guardrail added for maps: `map<K,V>` is rejected in `@deterministic` functions in favor of `ordered_map<K,V>`.
 - Immediate focus for next milestone:
-	- deepen generic inference for collection constructors,
-	- broaden runtime and optimizer coverage for new stdlib operations,
-	- improve LLVM parity for runtime-backed features.
+	- broaden runtime and optimizer coverage for additional stdlib operations beyond current collection/string surface,
+	- continue LLVM parity expansion for richer value semantics (for example string equality and formatted output coverage),
+	- complete remaining Category 1 gaps outside the current bootstrap subset (refs/pointers and broader conformance matrix).
 
 ## Global Program Architecture
 - Compiler executable is split into frontend, middle-end, backend, and tooling layers

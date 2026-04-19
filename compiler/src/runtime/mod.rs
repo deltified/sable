@@ -462,6 +462,40 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
                 .ok_or_else(|| anyhow!("vec.get index {} out of bounds", index))?;
             Ok((true, Some(value)))
         }
+        "vec.remove" => {
+            if args.len() != 2 {
+                bail!("vec.remove expects exactly two arguments")
+            }
+            let index = value_as_index(&args[1])?;
+            let RuntimeValue::Vec(mut values) = args.remove(0) else {
+                bail!("vec.remove first argument must be vec<T>")
+            };
+
+            if index >= values.len() {
+                bail!("vec.remove index {} out of bounds", index)
+            }
+            values.remove(index);
+            Ok((true, Some(RuntimeValue::Vec(values))))
+        }
+        "vec.clear" => {
+            if args.len() != 1 {
+                bail!("vec.clear expects exactly one argument")
+            }
+            let RuntimeValue::Vec(mut values) = args.pop().expect("arg exists") else {
+                bail!("vec.clear argument must be vec<T>")
+            };
+            values.clear();
+            Ok((true, Some(RuntimeValue::Vec(values))))
+        }
+        "vec.is_empty" => {
+            if args.len() != 1 {
+                bail!("vec.is_empty expects exactly one argument")
+            }
+            let RuntimeValue::Vec(values) = args.pop().expect("arg exists") else {
+                bail!("vec.is_empty argument must be vec<T>")
+            };
+            Ok((true, Some(RuntimeValue::Bool(values.is_empty()))))
+        }
         "vec.len" => {
             if args.len() != 1 {
                 bail!("vec.len expects exactly one argument")
@@ -539,6 +573,39 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
             let key = runtime_key_from_value(&key_value)?;
             Ok((true, Some(RuntimeValue::Bool(map.contains_key(&key)))))
         }
+        "map.remove" => {
+            if args.len() != 2 {
+                bail!("map.remove expects arguments (map<K, V>, K)")
+            }
+
+            let key_value = args.pop().expect("arg exists");
+            let RuntimeValue::Map(mut map) = args.pop().expect("arg exists") else {
+                bail!("map.remove first argument must be map<K, V>")
+            };
+
+            let key = runtime_key_from_value(&key_value)?;
+            map.remove(&key);
+            Ok((true, Some(RuntimeValue::Map(map))))
+        }
+        "map.clear" => {
+            if args.len() != 1 {
+                bail!("map.clear expects one map<K, V> argument")
+            }
+            let RuntimeValue::Map(mut map) = args.pop().expect("arg exists") else {
+                bail!("map.clear first argument must be map<K, V>")
+            };
+            map.clear();
+            Ok((true, Some(RuntimeValue::Map(map))))
+        }
+        "map.is_empty" => {
+            if args.len() != 1 {
+                bail!("map.is_empty expects one map<K, V> argument")
+            }
+            let RuntimeValue::Map(map) = args.pop().expect("arg exists") else {
+                bail!("map.is_empty first argument must be map<K, V>")
+            };
+            Ok((true, Some(RuntimeValue::Bool(map.is_empty()))))
+        }
         "map.len" => {
             if args.len() != 1 {
                 bail!("map.len expects one map<K, V> argument")
@@ -598,6 +665,39 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
 
             let key = runtime_key_from_value(&key_value)?;
             Ok((true, Some(RuntimeValue::Bool(map.contains_key(&key)))))
+        }
+        "ordered_map.remove" => {
+            if args.len() != 2 {
+                bail!("ordered_map.remove expects arguments (ordered_map<K, V>, K)")
+            }
+
+            let key_value = args.pop().expect("arg exists");
+            let RuntimeValue::OrderedMap(mut map) = args.pop().expect("arg exists") else {
+                bail!("ordered_map.remove first argument must be ordered_map<K, V>")
+            };
+
+            let key = runtime_key_from_value(&key_value)?;
+            map.remove(&key);
+            Ok((true, Some(RuntimeValue::OrderedMap(map))))
+        }
+        "ordered_map.clear" => {
+            if args.len() != 1 {
+                bail!("ordered_map.clear expects one ordered_map<K, V> argument")
+            }
+            let RuntimeValue::OrderedMap(mut map) = args.pop().expect("arg exists") else {
+                bail!("ordered_map.clear first argument must be ordered_map<K, V>")
+            };
+            map.clear();
+            Ok((true, Some(RuntimeValue::OrderedMap(map))))
+        }
+        "ordered_map.is_empty" => {
+            if args.len() != 1 {
+                bail!("ordered_map.is_empty expects one ordered_map<K, V> argument")
+            }
+            let RuntimeValue::OrderedMap(map) = args.pop().expect("arg exists") else {
+                bail!("ordered_map.is_empty first argument must be ordered_map<K, V>")
+            };
+            Ok((true, Some(RuntimeValue::Bool(map.is_empty()))))
         }
         "ordered_map.len" => {
             if args.len() != 1 {
@@ -735,5 +835,102 @@ fn main() -> i64
 
         let value = run_main(&program).expect("runtime should execute");
         assert_eq!(value, Some(RuntimeValue::Int(44)));
+    }
+
+    #[test]
+    fn executes_collection_mutation_and_dynamic_for_loops() {
+        let src = r#"
+fn main() -> i32
+    effects(alloc)
+{
+    let total = 0s
+
+    let text = "Sable"
+    for ch in text {
+        total += ch
+    }
+
+    let values: vec<i32> = vec.new()
+    values = vec.push(values, 10s)
+    values = vec.push(values, 20s)
+    values = vec.push(values, 30s)
+    for value in values {
+        total += value
+    }
+
+    values = vec.remove(values, 1)
+    let values_empty_before = vec.is_empty(values)
+    let values_len = vec.len(values)
+    values = vec.clear(values)
+    let values_empty_after = vec.is_empty(values)
+
+    let m: map<str, i32> = map.new()
+    m = map.put(m, "a", 1s)
+    m = map.put(m, "b", 2s)
+    m = map.remove(m, "a")
+    let has_a = map.contains(m, "a")
+    m = map.clear(m)
+    let m_empty = map.is_empty(m)
+
+    let om: ordered_map<str, i32> = ordered_map.new()
+    om = ordered_map.put(om, "left", 1s)
+    om = ordered_map.put(om, "right", 2s)
+    om = ordered_map.remove(om, "left")
+    let has_left = ordered_map.contains(om, "left")
+    om = ordered_map.clear(om)
+    let om_empty = ordered_map.is_empty(om)
+
+    if values_empty_before {
+        total += 1000s
+    } else {
+        total += 1s
+    }
+
+    if values_empty_after {
+        total += 2s
+    }
+
+    if has_a {
+        total += 1000s
+    } else {
+        total += 4s
+    }
+
+    if m_empty {
+        total += 8s
+    }
+
+    if has_left {
+        total += 1000s
+    } else {
+        total += 16s
+    }
+
+    if om_empty {
+        total += 32s
+    }
+
+    if values_len == 2 {
+        total += 64s
+    }
+
+    return total
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (checked, sema_diags) = sema::check(&module);
+        assert!(!sema_diags.has_errors());
+
+        let mut program = mir::lower(&module, &checked).expect("MIR lowering should succeed");
+        mir::optimize(&mut program);
+
+        let value = run_main(&program).expect("runtime should execute");
+        assert_eq!(value, Some(RuntimeValue::Int(674)));
     }
 }

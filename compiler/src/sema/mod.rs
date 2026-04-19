@@ -367,6 +367,31 @@ impl<'a> FunctionChecker<'a> {
                 span,
             } => {
                 let annotated = annotation.as_ref().map(lower_type_no_ctx);
+
+                if value.is_none() {
+                    if annotated.is_none() {
+                        self.diagnostics.error(
+                            "SEM070",
+                            format!(
+                                "variable '{}' requires either an explicit type annotation or an initializer",
+                                name
+                            ),
+                            Some(*span),
+                        );
+                    } else if let Some(annotation_ty) = annotated.as_ref()
+                        && requires_explicit_initializer(annotation_ty)
+                    {
+                        self.diagnostics.error(
+                            "SEM069",
+                            format!(
+                                "variable '{}' of type {:?} requires an explicit initializer to avoid hidden allocation",
+                                name, annotation_ty
+                            ),
+                            Some(*span),
+                        );
+                    }
+                }
+
                 let value_ty = value
                     .as_ref()
                     .map(|expr| self.check_expr(expr))
@@ -469,6 +494,8 @@ impl<'a> FunctionChecker<'a> {
                         inner,
                         size: Some(_),
                     } => *inner,
+                    Type::Vec(inner) => *inner,
+                    Type::Str => Type::I32,
                     Type::Array { size: None, .. } => {
                         self.diagnostics.error(
                             "SEM018",
@@ -477,18 +504,10 @@ impl<'a> FunctionChecker<'a> {
                         );
                         Type::Unknown
                     }
-                    Type::Str => {
-                        self.diagnostics.error(
-                            "SEM019",
-                            "for-loop over string is not supported yet",
-                            Some(*span),
-                        );
-                        Type::Unknown
-                    }
                     _ => {
                         self.diagnostics.error(
                             "SEM015",
-                            "for-loop iterable must be range or fixed-size array",
+                            "for-loop iterable must be range, fixed-size array, vec<T>, or str",
                             Some(*span),
                         );
                         Type::Unknown
@@ -609,11 +628,22 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
 
+                let mut result_ty = target_ty.clone();
+                if matches!(op, AssignOp::Assign)
+                    && let ExprKind::Name(name) = &target.kind
+                {
+                    let refined_ty = merge_inferred_type(&target_ty, &value_ty);
+                    if refined_ty != target_ty {
+                        self.update_local_type(name, refined_ty.clone());
+                        result_ty = refined_ty;
+                    }
+                }
+
                 if !matches!(target.kind, ExprKind::Name(_)) {
                     self.used_effects.add_effect("mut");
                 }
 
-                target_ty
+                result_ty
             }
             ExprKind::PostIncrement { target } => {
                 let target_ty = self.lvalue_type(target);
@@ -987,6 +1017,60 @@ impl<'a> FunctionChecker<'a> {
 
                 Some(inner.as_ref().clone())
             }
+            ("vec", "remove") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.remove expects arguments (vec<T>, index)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if !arg_types[1].is_integral() {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.remove expects an integral index",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::Vec(inner) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.remove first argument must be vec<T>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                Some(Type::Vec(inner.clone()))
+            }
+            ("vec", "clear") => {
+                if arg_types.len() != 1 || !matches!(&arg_types[0], Type::Vec(_)) {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.clear expects one vec<T> argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(arg_types[0].clone())
+            }
+            ("vec", "is_empty") => {
+                if arg_types.len() != 1 || !matches!(&arg_types[0], Type::Vec(_)) {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.is_empty expects one vec<T> argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::Bool)
+            }
             ("vec", "len") => {
                 if arg_types.len() != 1 {
                     self.diagnostics.error(
@@ -1175,6 +1259,66 @@ impl<'a> FunctionChecker<'a> {
 
                 Some(Type::Bool)
             }
+            ("map", "remove") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM063",
+                        "map.remove expects arguments (map<K, V>, K)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::Map(key_ty, value_ty) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM063",
+                        "map.remove first argument must be map<K, V>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                if !is_unknown_type(key_ty.as_ref())
+                    && !self.is_assignable(key_ty.as_ref(), &arg_types[1])
+                {
+                    self.diagnostics.error(
+                        "SEM063",
+                        format!(
+                            "map.remove key type mismatch: expected {:?}, got {:?}",
+                            key_ty,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::Map(key_ty.clone(), value_ty.clone()))
+            }
+            ("map", "clear") => {
+                if arg_types.len() != 1 || !matches!(&arg_types[0], Type::Map(_, _)) {
+                    self.diagnostics.error(
+                        "SEM063",
+                        "map.clear expects one map<K, V> argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(arg_types[0].clone())
+            }
+            ("map", "is_empty") => {
+                if arg_types.len() != 1 || !matches!(&arg_types[0], Type::Map(_, _)) {
+                    self.diagnostics.error(
+                        "SEM063",
+                        "map.is_empty expects one map<K, V> argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::Bool)
+            }
             ("map", "len") => {
                 if arg_types.len() != 1 || !matches!(&arg_types[0], Type::Map(_, _)) {
                     self.diagnostics.error(
@@ -1334,6 +1478,66 @@ impl<'a> FunctionChecker<'a> {
                             key_ty,
                             arg_types[1]
                         ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::Bool)
+            }
+            ("ordered_map", "remove") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM068",
+                        "ordered_map.remove expects arguments (ordered_map<K, V>, K)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::OrderedMap(key_ty, value_ty) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM068",
+                        "ordered_map.remove first argument must be ordered_map<K, V>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                if !is_unknown_type(key_ty.as_ref())
+                    && !self.is_assignable(key_ty.as_ref(), &arg_types[1])
+                {
+                    self.diagnostics.error(
+                        "SEM068",
+                        format!(
+                            "ordered_map.remove key type mismatch: expected {:?}, got {:?}",
+                            key_ty,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::OrderedMap(key_ty.clone(), value_ty.clone()))
+            }
+            ("ordered_map", "clear") => {
+                if arg_types.len() != 1 || !matches!(&arg_types[0], Type::OrderedMap(_, _)) {
+                    self.diagnostics.error(
+                        "SEM068",
+                        "ordered_map.clear expects one ordered_map<K, V> argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(arg_types[0].clone())
+            }
+            ("ordered_map", "is_empty") => {
+                if arg_types.len() != 1 || !matches!(&arg_types[0], Type::OrderedMap(_, _)) {
+                    self.diagnostics.error(
+                        "SEM068",
+                        "ordered_map.is_empty expects one ordered_map<K, V> argument",
                         Some(span),
                     );
                     return Some(Type::Unknown);
@@ -1516,6 +1720,15 @@ impl<'a> FunctionChecker<'a> {
         None
     }
 
+    fn update_local_type(&mut self, name: &str, refined: Type) {
+        for scope in self.locals.iter_mut().rev() {
+            if let Some(current) = scope.get_mut(name) {
+                *current = refined;
+                return;
+            }
+        }
+    }
+
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
             (Type::Unknown, _) | (_, Type::Unknown) => true,
@@ -1614,6 +1827,32 @@ fn is_hashable_map_key_type(ty: &Type) -> bool {
 
 fn is_orderable_map_key_type(ty: &Type) -> bool {
     is_hashable_map_key_type(ty)
+}
+
+fn requires_explicit_initializer(ty: &Type) -> bool {
+    matches!(ty, Type::Str | Type::Vec(_) | Type::Map(_, _) | Type::OrderedMap(_, _))
+}
+
+fn merge_inferred_type(current: &Type, inferred: &Type) -> Type {
+    match (current, inferred) {
+        (Type::Unknown, other) => other.clone(),
+        (other, Type::Unknown) => other.clone(),
+        (Type::Vec(current_inner), Type::Vec(inferred_inner)) => Type::Vec(Box::new(
+            merge_inferred_type(current_inner.as_ref(), inferred_inner.as_ref()),
+        )),
+        (Type::Map(current_k, current_v), Type::Map(inferred_k, inferred_v)) => Type::Map(
+            Box::new(merge_inferred_type(current_k.as_ref(), inferred_k.as_ref())),
+            Box::new(merge_inferred_type(current_v.as_ref(), inferred_v.as_ref())),
+        ),
+        (
+            Type::OrderedMap(current_k, current_v),
+            Type::OrderedMap(inferred_k, inferred_v),
+        ) => Type::OrderedMap(
+            Box::new(merge_inferred_type(current_k.as_ref(), inferred_k.as_ref())),
+            Box::new(merge_inferred_type(current_v.as_ref(), inferred_v.as_ref())),
+        ),
+        _ => current.clone(),
+    }
 }
 
 fn lower_type_no_ctx(syntax: &TypeSyntax) -> Type {
@@ -1749,5 +1988,49 @@ fn stable() -> i64
         let (_, sema_diags) = check(&module);
         assert!(sema_diags.has_errors());
         assert!(sema_diags.iter().any(|diag| diag.code == "SEM058"));
+    }
+
+    #[test]
+    fn allows_constructor_inference_via_assignment() {
+        let src = r#"
+fn main() -> i64
+    effects(alloc)
+{
+    let v = vec.new()
+    v = vec.push(v, 7)
+    return vec.get(v, 0)
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (_, sema_diags) = check(&module);
+        assert!(!sema_diags.has_errors());
+    }
+
+    #[test]
+    fn requires_initializer_for_alloc_like_locals() {
+        let src = r#"
+fn main() -> i64
+    effects(alloc)
+{
+    let s: str
+    return 0
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (_, sema_diags) = check(&module);
+        assert!(sema_diags.has_errors());
+        assert!(sema_diags.iter().any(|diag| diag.code == "SEM069"));
     }
 }

@@ -340,7 +340,7 @@ impl<'a> MirLowerer<'a> {
                         Some(LoweredValue::Scalar(value)) => Some(value.ty.clone()),
                         _ => None,
                     })
-                    .unwrap_or(Type::I64);
+                    .unwrap_or(Type::Unknown);
 
                 let destination = self.define_local(name, final_ty.clone())?;
 
@@ -609,20 +609,142 @@ impl<'a> MirLowerer<'a> {
 
                 self.lower_for_fixed_array(loop_name, body, current_bb, array_local, elem_ty, size)
             }
+            Type::Vec(inner) => {
+                let elem_ty = inner.as_ref().clone();
+                let vec_local = match operand {
+                    MirOperand::Local(local) => local,
+                    value => {
+                        let temp = self.new_temp(Type::Vec(inner.clone()));
+                        self.emit(
+                            current_bb,
+                            MirInstruction {
+                                dest: Some(temp.clone()),
+                                ty: Type::Vec(inner),
+                                effects: BTreeSet::new(),
+                                kind: MirInstructionKind::Copy(value),
+                            },
+                        )?;
+                        temp
+                    }
+                };
+
+                self.lower_for_dynamic_indexable(
+                    loop_name,
+                    body,
+                    current_bb,
+                    vec_local,
+                    elem_ty,
+                    "vec.len",
+                )
+            }
+            Type::Str => {
+                let str_local = match operand {
+                    MirOperand::Local(local) => local,
+                    value => {
+                        let temp = self.new_temp(Type::Str);
+                        self.emit(
+                            current_bb,
+                            MirInstruction {
+                                dest: Some(temp.clone()),
+                                ty: Type::Str,
+                                effects: BTreeSet::new(),
+                                kind: MirInstructionKind::Copy(value),
+                            },
+                        )?;
+                        temp
+                    }
+                };
+
+                self.lower_for_dynamic_indexable(
+                    loop_name,
+                    body,
+                    current_bb,
+                    str_local,
+                    Type::I32,
+                    "str.len",
+                )
+            }
             Type::Array { size: None, .. } => Err(anyhow!(
                 "for-loop over unsized arrays is not supported in '{}'",
                 self.ast_function.name
             )),
-            Type::Str => Err(anyhow!(
-                "for-loop over strings is not supported in '{}'",
-                self.ast_function.name
-            )),
             other => Err(anyhow!(
-                "for-loop iterable must be range or fixed-size array, got {:?} in '{}'",
+                "for-loop iterable must be range, fixed-size array, vec<T>, or str, got {:?} in '{}'",
                 other,
                 self.ast_function.name
             )),
         }
+    }
+
+    fn lower_for_dynamic_indexable(
+        &mut self,
+        loop_name: &str,
+        body: &Block,
+        current_bb: BlockId,
+        base_local: String,
+        elem_ty: Type,
+        len_builtin: &str,
+    ) -> Result<Option<BlockId>> {
+        let iter_local = self.define_hidden_local("__for_idx", Type::I64)?;
+        let end_local = self.define_hidden_local("__for_len", Type::I64)?;
+
+        self.emit(
+            current_bb,
+            MirInstruction {
+                dest: Some(iter_local.clone()),
+                ty: Type::I64,
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Copy(MirOperand::Const(MirConst::Int(0, Type::I64))),
+            },
+        )?;
+
+        let len_temp = self.new_temp(Type::I64);
+        self.emit(
+            current_bb,
+            MirInstruction {
+                dest: Some(len_temp.clone()),
+                ty: Type::I64,
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Call {
+                    callee: len_builtin.to_string(),
+                    args: vec![MirOperand::Local(base_local.clone())],
+                },
+            },
+        )?;
+        self.emit(
+            current_bb,
+            MirInstruction {
+                dest: Some(end_local.clone()),
+                ty: Type::I64,
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Copy(MirOperand::Local(len_temp)),
+            },
+        )?;
+
+        self.lower_for_loop_core(
+            loop_name,
+            body,
+            current_bb,
+            iter_local,
+            end_local,
+            elem_ty.clone(),
+            Type::I64,
+            |lowerer, body_bb, loop_var, iter_local_name| {
+                lowerer.emit(
+                    body_bb,
+                    MirInstruction {
+                        dest: Some(loop_var),
+                        ty: elem_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::IndexLoad {
+                            base: MirOperand::Local(base_local.clone()),
+                            index: MirOperand::Local(iter_local_name),
+                        },
+                    },
+                )
+            },
+            MirOperand::Const(MirConst::Int(1, Type::I64)),
+        )
     }
 
     fn lower_for_fixed_array(
@@ -868,6 +990,28 @@ impl<'a> MirLowerer<'a> {
                     }));
                 }
 
+                if *op == BinaryOp::Add && lhs.ty == Type::Str && rhs.ty == Type::Str {
+                    let mut effects = BTreeSet::new();
+                    effects.insert("alloc".to_string());
+                    let temp = self.new_temp(Type::Str);
+                    self.emit(
+                        current_bb,
+                        MirInstruction {
+                            dest: Some(temp.clone()),
+                            ty: Type::Str,
+                            effects,
+                            kind: MirInstructionKind::Call {
+                                callee: "str.concat".to_string(),
+                                args: vec![lhs.operand, rhs.operand],
+                            },
+                        },
+                    )?;
+                    return Ok(LoweredValue::Scalar(TypedOperand {
+                        operand: MirOperand::Local(temp),
+                        ty: Type::Str,
+                    }));
+                }
+
                 let result_ty = binary_result_type(*op, &lhs.ty);
                 let temp = self.new_temp(result_ty.clone());
                 self.emit(
@@ -897,7 +1041,16 @@ impl<'a> MirLowerer<'a> {
                     ));
                 };
 
-                let (target_local, target_ty) = self.lookup_local(name)?;
+                let (target_local, mut target_ty) = self.lookup_local(name)?;
+                if matches!(op, AssignOp::Assign) {
+                    let refined_ty = merge_inferred_type(&target_ty, &rhs.ty);
+                    if refined_ty != target_ty {
+                        self.local_types
+                            .insert(target_local.clone(), refined_ty.clone());
+                        target_ty = refined_ty;
+                    }
+                }
+
                 let instruction_kind = match op {
                     AssignOp::Assign => MirInstructionKind::Copy(rhs.operand),
                     AssignOp::AddAssign
@@ -1239,6 +1392,28 @@ impl<'a> MirLowerer<'a> {
                 };
                 Some(inner.as_ref().clone())
             }
+            "vec.remove" => {
+                if args.len() != 2 || !is_integral_type(&args[1].ty) {
+                    bail!("vec.remove expects (vec<T>, integral index)");
+                }
+
+                let Type::Vec(inner) = &args[0].ty else {
+                    bail!("vec.remove first argument must be vec<T>");
+                };
+                Some(Type::Vec(inner.clone()))
+            }
+            "vec.clear" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::Vec(_)) {
+                    bail!("vec.clear expects one vec<T> argument");
+                }
+                Some(args[0].ty.clone())
+            }
+            "vec.is_empty" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::Vec(_)) {
+                    bail!("vec.is_empty expects one vec<T> argument");
+                }
+                Some(Type::Bool)
+            }
             "vec.len" => {
                 if args.len() != 1 || !matches!(args[0].ty, Type::Vec(_)) {
                     bail!("vec.len expects one vec<T> argument");
@@ -1343,6 +1518,39 @@ impl<'a> MirLowerer<'a> {
 
                 Some(Type::Bool)
             }
+            "map.remove" => {
+                if args.len() != 2 {
+                    bail!("map.remove expects (map<K, V>, K)");
+                }
+
+                let Type::Map(key_ty, value_ty) = &args[0].ty else {
+                    bail!("map.remove first argument must be map<K, V>");
+                };
+
+                if !is_unknown_type(key_ty.as_ref())
+                    && !is_assignable_type(key_ty.as_ref(), &args[1].ty)
+                {
+                    bail!(
+                        "map.remove key type mismatch: expected {:?}, got {:?}",
+                        key_ty,
+                        args[1].ty
+                    );
+                }
+
+                Some(Type::Map(key_ty.clone(), value_ty.clone()))
+            }
+            "map.clear" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::Map(_, _)) {
+                    bail!("map.clear expects one map<K, V> argument");
+                }
+                Some(args[0].ty.clone())
+            }
+            "map.is_empty" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::Map(_, _)) {
+                    bail!("map.is_empty expects one map<K, V> argument");
+                }
+                Some(Type::Bool)
+            }
             "map.len" => {
                 if args.len() != 1 || !matches!(args[0].ty, Type::Map(_, _)) {
                     bail!("map.len expects one map<K, V> argument");
@@ -1445,6 +1653,39 @@ impl<'a> MirLowerer<'a> {
                     );
                 }
 
+                Some(Type::Bool)
+            }
+            "ordered_map.remove" => {
+                if args.len() != 2 {
+                    bail!("ordered_map.remove expects (ordered_map<K, V>, K)");
+                }
+
+                let Type::OrderedMap(key_ty, value_ty) = &args[0].ty else {
+                    bail!("ordered_map.remove first argument must be ordered_map<K, V>");
+                };
+
+                if !is_unknown_type(key_ty.as_ref())
+                    && !is_assignable_type(key_ty.as_ref(), &args[1].ty)
+                {
+                    bail!(
+                        "ordered_map.remove key type mismatch: expected {:?}, got {:?}",
+                        key_ty,
+                        args[1].ty
+                    );
+                }
+
+                Some(Type::OrderedMap(key_ty.clone(), value_ty.clone()))
+            }
+            "ordered_map.clear" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::OrderedMap(_, _)) {
+                    bail!("ordered_map.clear expects one ordered_map<K, V> argument");
+                }
+                Some(args[0].ty.clone())
+            }
+            "ordered_map.is_empty" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::OrderedMap(_, _)) {
+                    bail!("ordered_map.is_empty expects one ordered_map<K, V> argument");
+                }
                 Some(Type::Bool)
             }
             "ordered_map.len" => {
@@ -1677,6 +1918,28 @@ fn is_assignable_type(expected: &Type, actual: &Type) -> bool {
                 && is_assignable_type(expected_inner, actual_inner)
         }
         _ => expected == actual,
+    }
+}
+
+fn merge_inferred_type(current: &Type, inferred: &Type) -> Type {
+    match (current, inferred) {
+        (Type::Unknown, other) => other.clone(),
+        (other, Type::Unknown) => other.clone(),
+        (Type::Vec(current_inner), Type::Vec(inferred_inner)) => Type::Vec(Box::new(
+            merge_inferred_type(current_inner.as_ref(), inferred_inner.as_ref()),
+        )),
+        (Type::Map(current_k, current_v), Type::Map(inferred_k, inferred_v)) => Type::Map(
+            Box::new(merge_inferred_type(current_k.as_ref(), inferred_k.as_ref())),
+            Box::new(merge_inferred_type(current_v.as_ref(), inferred_v.as_ref())),
+        ),
+        (
+            Type::OrderedMap(current_k, current_v),
+            Type::OrderedMap(inferred_k, inferred_v),
+        ) => Type::OrderedMap(
+            Box::new(merge_inferred_type(current_k.as_ref(), inferred_k.as_ref())),
+            Box::new(merge_inferred_type(current_v.as_ref(), inferred_v.as_ref())),
+        ),
+        _ => current.clone(),
     }
 }
 
@@ -2084,5 +2347,66 @@ fn sum(values: [i64; 4]) -> i64
             .flat_map(|block| block.instructions.iter())
             .any(|instruction| matches!(instruction.kind, MirInstructionKind::IndexLoad { .. }));
         assert!(has_index_load, "expected array iteration to emit IndexLoad");
+    }
+
+    #[test]
+    fn lowers_for_loop_over_vec_and_str() {
+        let src = r#"
+fn main() -> i32
+    effects(alloc)
+{
+    let total = 0s
+    let text = "ab"
+    for ch in text {
+        total += ch
+    }
+
+    let values: vec<i32> = vec.new()
+    values = vec.push(values, 1s)
+    values = vec.push(values, 2s)
+    for value in values {
+        total += value
+    }
+
+    return total
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (ast, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (checked, sema_diags) = sema::check(&ast);
+        assert!(!sema_diags.has_errors());
+
+        let mut mir = lower(&ast, &checked).expect("mir lowering should succeed");
+        optimize(&mut mir);
+
+        let main_fn = mir.functions.get("main").expect("main function present");
+        let calls = main_fn
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .filter_map(|instruction| match &instruction.kind {
+                MirInstructionKind::Call { callee, .. } => Some(callee.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(calls.iter().any(|callee| *callee == "str.len"));
+        assert!(calls.iter().any(|callee| *callee == "vec.len"));
+
+        let index_load_count = main_fn
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .filter(|instruction| matches!(instruction.kind, MirInstructionKind::IndexLoad { .. }))
+            .count();
+        assert!(
+            index_load_count >= 2,
+            "expected both string and vec loops to emit IndexLoad operations"
+        );
     }
 }
