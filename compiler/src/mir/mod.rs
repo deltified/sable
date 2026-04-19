@@ -1,0 +1,1426 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use anyhow::{Result, anyhow, bail};
+
+use crate::ast::{
+    AssignOp, BinaryOp, Block, Expr, ExprKind, FunctionDecl, Module, Stmt, TypeSyntax, UnaryOp,
+};
+use crate::sema::{CheckedProgram, EffectSet, Type};
+
+pub type BlockId = usize;
+
+#[derive(Debug, Clone, Default)]
+pub struct MirProgram {
+    pub functions: BTreeMap<String, MirFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub params: Vec<MirParam>,
+    pub return_type: Type,
+    pub effects: EffectSet,
+    pub attrs: Vec<String>,
+    pub entry: BlockId,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirParam {
+    pub name: String,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: BlockId,
+    pub label: String,
+    pub instructions: Vec<MirInstruction>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirInstruction {
+    pub dest: Option<String>,
+    pub ty: Type,
+    pub effects: BTreeSet<String>,
+    pub kind: MirInstructionKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirInstructionKind {
+    Copy(MirOperand),
+    Unary {
+        op: UnaryOp,
+        operand: MirOperand,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: MirOperand,
+        rhs: MirOperand,
+    },
+    Call {
+        callee: String,
+        args: Vec<MirOperand>,
+    },
+    MemberLoad {
+        base: MirOperand,
+        field: String,
+    },
+    IndexLoad {
+        base: MirOperand,
+        index: MirOperand,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(BlockId),
+    Branch {
+        cond: MirOperand,
+        then_bb: BlockId,
+        else_bb: BlockId,
+    },
+    Return(Option<MirOperand>),
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Local(String),
+    Const(MirConst),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirConst {
+    Int(i64, Type),
+    Float(f64, Type),
+    Bool(bool),
+    Str(String),
+}
+
+pub fn lower(module: &Module, checked: &CheckedProgram) -> Result<MirProgram> {
+    let mut program = MirProgram::default();
+
+    for item in &module.items {
+        let crate::ast::Item::Function(function) = item else {
+            continue;
+        };
+
+        let Some(signature) = checked.functions.get(&function.name) else {
+            continue;
+        };
+
+        let mir_function = MirLowerer::new(checked, function, signature).lower_function()?;
+        program.functions.insert(function.name.clone(), mir_function);
+    }
+
+    Ok(program)
+}
+
+pub fn optimize(program: &mut MirProgram) {
+    for function in program.functions.values_mut() {
+        constant_fold_function(function);
+        eliminate_dead_branches(function);
+    }
+}
+
+struct MirLowerer<'a> {
+    checked: &'a CheckedProgram,
+    ast_function: &'a FunctionDecl,
+    signature: &'a crate::sema::FunctionSig,
+    blocks: Vec<MirBlockBuilder>,
+    next_temp: usize,
+    next_local: usize,
+    scopes: Vec<BTreeMap<String, String>>,
+    local_types: BTreeMap<String, Type>,
+    loop_stack: Vec<LoopTargets>,
+}
+
+#[derive(Clone, Copy)]
+struct LoopTargets {
+    break_bb: BlockId,
+    continue_bb: BlockId,
+}
+
+struct MirBlockBuilder {
+    label: String,
+    instructions: Vec<MirInstruction>,
+    terminator: Option<MirTerminator>,
+}
+
+#[derive(Debug, Clone)]
+enum LoweredValue {
+    Scalar(TypedOperand),
+    Range {
+        start: TypedOperand,
+        end: TypedOperand,
+        elem_ty: Type,
+    },
+    Void,
+}
+
+#[derive(Debug, Clone)]
+struct TypedOperand {
+    operand: MirOperand,
+    ty: Type,
+}
+
+impl<'a> MirLowerer<'a> {
+    fn new(
+        checked: &'a CheckedProgram,
+        ast_function: &'a FunctionDecl,
+        signature: &'a crate::sema::FunctionSig,
+    ) -> Self {
+        Self {
+            checked,
+            ast_function,
+            signature,
+            blocks: Vec::new(),
+            next_temp: 0,
+            next_local: 0,
+            scopes: vec![BTreeMap::new()],
+            local_types: BTreeMap::new(),
+            loop_stack: Vec::new(),
+        }
+    }
+
+    fn lower_function(mut self) -> Result<MirFunction> {
+        if self.ast_function.is_extern || self.ast_function.body.is_none() {
+            return Ok(MirFunction {
+                name: self.ast_function.name.clone(),
+                params: self
+                    .ast_function
+                    .params
+                    .iter()
+                    .zip(self.signature.params.iter())
+                    .map(|(param, ty)| MirParam {
+                        name: param.name.clone(),
+                        ty: ty.clone(),
+                    })
+                    .collect(),
+                return_type: self.signature.return_type.clone(),
+                effects: self.signature.declared_effects.clone(),
+                attrs: self.signature.attrs.clone(),
+                entry: 0,
+                blocks: Vec::new(),
+            });
+        }
+
+        let entry = self.new_block("entry");
+
+        for (param, ty) in self
+            .ast_function
+            .params
+            .iter()
+            .zip(self.signature.params.iter())
+        {
+            self.define_local_with_exact_name(&param.name, ty.clone())?;
+        }
+
+        let body = self
+            .ast_function
+            .body
+            .as_ref()
+            .expect("checked body presence");
+
+        let tail = self.lower_ast_block(body, entry)?;
+        if let Some(tail_bb) = tail {
+            if self.blocks[tail_bb].terminator.is_none() {
+                if self.signature.return_type == Type::Void {
+                    self.set_terminator(tail_bb, MirTerminator::Return(None))?;
+                } else {
+                    bail!(
+                        "function '{}' can reach the end without returning a value",
+                        self.ast_function.name
+                    );
+                }
+            }
+        }
+
+        let blocks = self
+            .blocks
+            .into_iter()
+            .enumerate()
+            .map(|(id, block)| MirBlock {
+                id,
+                label: block.label,
+                instructions: block.instructions,
+                terminator: block.terminator.unwrap_or(MirTerminator::Unreachable),
+            })
+            .collect::<Vec<_>>();
+
+        Ok(MirFunction {
+            name: self.ast_function.name.clone(),
+            params: self
+                .ast_function
+                .params
+                .iter()
+                .zip(self.signature.params.iter())
+                .map(|(param, ty)| MirParam {
+                    name: param.name.clone(),
+                    ty: ty.clone(),
+                })
+                .collect(),
+            return_type: self.signature.return_type.clone(),
+            effects: self.signature.declared_effects.clone(),
+            attrs: self.signature.attrs.clone(),
+            entry,
+            blocks,
+        })
+    }
+
+    fn lower_ast_block(&mut self, block: &Block, start_bb: BlockId) -> Result<Option<BlockId>> {
+        self.scopes.push(BTreeMap::new());
+
+        let mut current = Some(start_bb);
+        for stmt in &block.statements {
+            let Some(bb) = current else {
+                break;
+            };
+            current = self.lower_stmt(stmt, bb)?;
+        }
+
+        self.scopes.pop();
+        Ok(current)
+    }
+
+    fn lower_stmt(&mut self, stmt: &Stmt, current_bb: BlockId) -> Result<Option<BlockId>> {
+        match stmt {
+            Stmt::Let {
+                name,
+                annotation,
+                value,
+                ..
+            } => {
+                let declared_ty = annotation.as_ref().map(lower_type_syntax_no_ctx);
+                let lowered_value = if let Some(expr) = value {
+                    Some(self.lower_expr(expr, current_bb)?)
+                } else {
+                    None
+                };
+
+                let final_ty = declared_ty
+                    .clone()
+                    .or_else(|| match &lowered_value {
+                        Some(LoweredValue::Scalar(value)) => Some(value.ty.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or(Type::I64);
+
+                let destination = self.define_local(name, final_ty.clone())?;
+
+                let init_operand = match lowered_value {
+                    Some(LoweredValue::Scalar(value)) => value.operand,
+                    Some(LoweredValue::Void) => {
+                        return Err(anyhow!(
+                            "variable '{}' cannot be initialized from a void expression",
+                            name
+                        ));
+                    }
+                    Some(LoweredValue::Range { .. }) => {
+                        return Err(anyhow!(
+                            "variable '{}' cannot be initialized from a range expression",
+                            name
+                        ));
+                    }
+                    None => default_value_for_type(&final_ty),
+                };
+
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(destination),
+                        ty: final_ty,
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Copy(init_operand),
+                    },
+                )?;
+
+                Ok(Some(current_bb))
+            }
+            Stmt::Return { value, .. } => {
+                let terminator = match value {
+                    None => MirTerminator::Return(None),
+                    Some(expr) => match self.lower_expr(expr, current_bb)? {
+                        LoweredValue::Scalar(value) => MirTerminator::Return(Some(value.operand)),
+                        LoweredValue::Void => MirTerminator::Return(None),
+                        LoweredValue::Range { .. } => {
+                            return Err(anyhow!(
+                                "cannot return a range expression directly in '{}'",
+                                self.ast_function.name
+                            ));
+                        }
+                    },
+                };
+
+                self.set_terminator(current_bb, terminator)?;
+                Ok(None)
+            }
+            Stmt::Raise { error, .. } => {
+                let _ = self.lower_expr(error, current_bb)?;
+                self.set_terminator(current_bb, MirTerminator::Unreachable)?;
+                Ok(None)
+            }
+            Stmt::If {
+                condition,
+                then_block,
+                else_block,
+                ..
+            } => {
+                let cond_value = self.lower_expr(condition, current_bb)?;
+                let cond = self.expect_scalar(cond_value)?;
+                let then_bb = self.new_block("if.then");
+                let else_bb = self.new_block("if.else");
+                let merge_bb = self.new_block("if.merge");
+
+                self.set_terminator(
+                    current_bb,
+                    MirTerminator::Branch {
+                        cond: cond.operand,
+                        then_bb,
+                        else_bb,
+                    },
+                )?;
+
+                let then_tail = self.lower_ast_block(then_block, then_bb)?;
+                if let Some(tail) = then_tail {
+                    self.set_terminator(tail, MirTerminator::Goto(merge_bb))?;
+                }
+
+                let else_tail = if let Some(else_block) = else_block {
+                    self.lower_ast_block(else_block, else_bb)?
+                } else {
+                    Some(else_bb)
+                };
+
+                if let Some(tail) = else_tail {
+                    self.set_terminator(tail, MirTerminator::Goto(merge_bb))?;
+                }
+
+                if then_tail.is_none() && else_tail.is_none() {
+                    Ok(None)
+                } else {
+                    Ok(Some(merge_bb))
+                }
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                let cond_bb = self.new_block("while.cond");
+                let body_bb = self.new_block("while.body");
+                let end_bb = self.new_block("while.end");
+
+                self.set_terminator(current_bb, MirTerminator::Goto(cond_bb))?;
+
+                let cond_value = self.lower_expr(condition, cond_bb)?;
+                let cond_operand = self.expect_scalar(cond_value)?;
+                self.set_terminator(
+                    cond_bb,
+                    MirTerminator::Branch {
+                        cond: cond_operand.operand,
+                        then_bb: body_bb,
+                        else_bb: end_bb,
+                    },
+                )?;
+
+                self.loop_stack.push(LoopTargets {
+                    break_bb: end_bb,
+                    continue_bb: cond_bb,
+                });
+                let body_tail = self.lower_ast_block(body, body_bb)?;
+                self.loop_stack.pop();
+
+                if let Some(tail) = body_tail {
+                    self.set_terminator(tail, MirTerminator::Goto(cond_bb))?;
+                }
+
+                Ok(Some(end_bb))
+            }
+            Stmt::For {
+                name,
+                iterable,
+                body,
+                ..
+            } => {
+                let lowered_iterable = self.lower_expr(iterable, current_bb)?;
+                let LoweredValue::Range {
+                    start,
+                    end,
+                    elem_ty,
+                } = lowered_iterable
+                else {
+                    return Err(anyhow!(
+                        "for-loop iterable must lower to range in function '{}'",
+                        self.ast_function.name
+                    ));
+                };
+
+                let iter_local = self.define_hidden_local("__for_iter", elem_ty.clone())?;
+                let end_local = self.define_hidden_local("__for_end", elem_ty.clone())?;
+
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(iter_local.clone()),
+                        ty: elem_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Copy(start.operand),
+                    },
+                )?;
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(end_local.clone()),
+                        ty: elem_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Copy(end.operand),
+                    },
+                )?;
+
+                let cond_bb = self.new_block("for.cond");
+                let body_bb = self.new_block("for.body");
+                let step_bb = self.new_block("for.step");
+                let end_bb = self.new_block("for.end");
+
+                self.set_terminator(current_bb, MirTerminator::Goto(cond_bb))?;
+
+                let cond_temp = self.new_temp(Type::Bool);
+                self.emit(
+                    cond_bb,
+                    MirInstruction {
+                        dest: Some(cond_temp.clone()),
+                        ty: Type::Bool,
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Binary {
+                            op: BinaryOp::Lt,
+                            lhs: MirOperand::Local(iter_local.clone()),
+                            rhs: MirOperand::Local(end_local.clone()),
+                        },
+                    },
+                )?;
+                self.set_terminator(
+                    cond_bb,
+                    MirTerminator::Branch {
+                        cond: MirOperand::Local(cond_temp),
+                        then_bb: body_bb,
+                        else_bb: end_bb,
+                    },
+                )?;
+
+                self.scopes.push(BTreeMap::new());
+                let loop_var = self.define_local(name, elem_ty.clone())?;
+                self.emit(
+                    body_bb,
+                    MirInstruction {
+                        dest: Some(loop_var),
+                        ty: elem_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Copy(MirOperand::Local(iter_local.clone())),
+                    },
+                )?;
+
+                self.loop_stack.push(LoopTargets {
+                    break_bb: end_bb,
+                    continue_bb: step_bb,
+                });
+                let body_tail = self.lower_ast_block(body, body_bb)?;
+                self.loop_stack.pop();
+                self.scopes.pop();
+
+                if let Some(tail) = body_tail {
+                    self.set_terminator(tail, MirTerminator::Goto(step_bb))?;
+                }
+
+                self.emit(
+                    step_bb,
+                    MirInstruction {
+                        dest: Some(iter_local.clone()),
+                        ty: elem_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Binary {
+                            op: BinaryOp::Add,
+                            lhs: MirOperand::Local(iter_local),
+                            rhs: int_one_for_type(&elem_ty),
+                        },
+                    },
+                )?;
+                self.set_terminator(step_bb, MirTerminator::Goto(cond_bb))?;
+
+                Ok(Some(end_bb))
+            }
+            Stmt::Break(_) => {
+                let Some(targets) = self.loop_stack.last().copied() else {
+                    return Err(anyhow!("'break' used outside of loop"));
+                };
+                self.set_terminator(current_bb, MirTerminator::Goto(targets.break_bb))?;
+                Ok(None)
+            }
+            Stmt::Continue(_) => {
+                let Some(targets) = self.loop_stack.last().copied() else {
+                    return Err(anyhow!("'continue' used outside of loop"));
+                };
+                self.set_terminator(current_bb, MirTerminator::Goto(targets.continue_bb))?;
+                Ok(None)
+            }
+            Stmt::Expr { expr, .. } => {
+                let _ = self.lower_expr(expr, current_bb)?;
+                Ok(Some(current_bb))
+            }
+            Stmt::Block(block) => self.lower_ast_block(block, current_bb),
+        }
+    }
+
+    fn lower_expr(&mut self, expr: &Expr, current_bb: BlockId) -> Result<LoweredValue> {
+        match &expr.kind {
+            ExprKind::Name(name) => {
+                let (local, ty) = self.lookup_local(name)?;
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Local(local),
+                    ty,
+                }))
+            }
+            ExprKind::IntLiteral(text) => {
+                let ty = infer_int_type(text);
+                let parsed = parse_int_literal(text)?;
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Const(MirConst::Int(parsed, ty.clone())),
+                    ty,
+                }))
+            }
+            ExprKind::FloatLiteral(text) => {
+                let ty = infer_float_type(text);
+                let parsed = parse_float_literal(text)?;
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Const(MirConst::Float(parsed, ty.clone())),
+                    ty,
+                }))
+            }
+            ExprKind::StringLiteral(text) => Ok(LoweredValue::Scalar(TypedOperand {
+                operand: MirOperand::Const(MirConst::Str(text.clone())),
+                ty: Type::Str,
+            })),
+            ExprKind::BoolLiteral(value) => Ok(LoweredValue::Scalar(TypedOperand {
+                operand: MirOperand::Const(MirConst::Bool(*value)),
+                ty: Type::Bool,
+            })),
+            ExprKind::Unary { op, expr: inner } => {
+                let inner_value = self.lower_expr(inner, current_bb)?;
+                let inner = self.expect_scalar(inner_value)?;
+
+                if let Some(constant) = fold_unary_constant(*op, &inner.operand) {
+                    let ty = match op {
+                        UnaryOp::Neg => inner.ty,
+                        UnaryOp::Not => Type::Bool,
+                    };
+                    return Ok(LoweredValue::Scalar(TypedOperand {
+                        operand: MirOperand::Const(constant),
+                        ty,
+                    }));
+                }
+
+                let result_ty = match op {
+                    UnaryOp::Neg => inner.ty,
+                    UnaryOp::Not => Type::Bool,
+                };
+                let temp = self.new_temp(result_ty.clone());
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(temp.clone()),
+                        ty: result_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Unary {
+                            op: *op,
+                            operand: inner.operand,
+                        },
+                    },
+                )?;
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Local(temp),
+                    ty: result_ty,
+                }))
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                if *op == BinaryOp::Range {
+                    let lhs_value = self.lower_expr(lhs, current_bb)?;
+                    let lhs = self.expect_scalar(lhs_value)?;
+                    let rhs_value = self.lower_expr(rhs, current_bb)?;
+                    let rhs = self.expect_scalar(rhs_value)?;
+                    return Ok(LoweredValue::Range {
+                        start: lhs.clone(),
+                        end: rhs,
+                        elem_ty: lhs.ty,
+                    });
+                }
+
+                let lhs_value = self.lower_expr(lhs, current_bb)?;
+                let lhs = self.expect_scalar(lhs_value)?;
+                let rhs_value = self.lower_expr(rhs, current_bb)?;
+                let rhs = self.expect_scalar(rhs_value)?;
+
+                if let Some(constant) = fold_binary_constant(*op, &lhs.operand, &rhs.operand) {
+                    let result_ty = binary_result_type(*op, &lhs.ty);
+                    return Ok(LoweredValue::Scalar(TypedOperand {
+                        operand: MirOperand::Const(constant),
+                        ty: result_ty,
+                    }));
+                }
+
+                let result_ty = binary_result_type(*op, &lhs.ty);
+                let temp = self.new_temp(result_ty.clone());
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(temp.clone()),
+                        ty: result_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Binary {
+                            op: *op,
+                            lhs: lhs.operand,
+                            rhs: rhs.operand,
+                        },
+                    },
+                )?;
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Local(temp),
+                    ty: result_ty,
+                }))
+            }
+            ExprKind::Assign { op, target, value } => {
+                let rhs_value = self.lower_expr(value, current_bb)?;
+                let rhs = self.expect_scalar(rhs_value)?;
+                let ExprKind::Name(name) = &target.kind else {
+                    return Err(anyhow!(
+                        "MIR lowering currently supports assignment only to local names"
+                    ));
+                };
+
+                let (target_local, target_ty) = self.lookup_local(name)?;
+                let instruction_kind = match op {
+                    AssignOp::Assign => MirInstructionKind::Copy(rhs.operand),
+                    AssignOp::AddAssign
+                    | AssignOp::SubAssign
+                    | AssignOp::MulAssign
+                    | AssignOp::DivAssign => {
+                        let bin_op = match op {
+                            AssignOp::AddAssign => BinaryOp::Add,
+                            AssignOp::SubAssign => BinaryOp::Sub,
+                            AssignOp::MulAssign => BinaryOp::Mul,
+                            AssignOp::DivAssign => BinaryOp::Div,
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        MirInstructionKind::Binary {
+                            op: bin_op,
+                            lhs: MirOperand::Local(target_local.clone()),
+                            rhs: rhs.operand,
+                        }
+                    }
+                };
+
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(target_local.clone()),
+                        ty: target_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: instruction_kind,
+                    },
+                )?;
+
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Local(target_local),
+                    ty: target_ty,
+                }))
+            }
+            ExprKind::PostIncrement { target } => {
+                let ExprKind::Name(name) = &target.kind else {
+                    return Err(anyhow!(
+                        "MIR lowering currently supports post-increment only on local names"
+                    ));
+                };
+
+                let (target_local, target_ty) = self.lookup_local(name)?;
+                let old_temp = self.new_temp(target_ty.clone());
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(old_temp.clone()),
+                        ty: target_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Copy(MirOperand::Local(target_local.clone())),
+                    },
+                )?;
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(target_local.clone()),
+                        ty: target_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Binary {
+                            op: BinaryOp::Add,
+                            lhs: MirOperand::Local(target_local),
+                            rhs: int_one_for_type(&target_ty),
+                        },
+                    },
+                )?;
+
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Local(old_temp),
+                    ty: target_ty,
+                }))
+            }
+            ExprKind::Call { callee, args } => {
+                let lowered_args = args
+                    .iter()
+                    .map(|arg| self.lower_expr(arg, current_bb))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|value| self.expect_scalar(value))
+                    .collect::<Result<Vec<_>>>()?;
+
+                let callee_name = match &callee.kind {
+                    ExprKind::Name(name) => name.clone(),
+                    ExprKind::Member { base, field } => {
+                        if let ExprKind::Name(base_name) = &base.kind {
+                            format!("{base_name}.{field}")
+                        } else {
+                            return Err(anyhow!(
+                                "only direct names and module-style members are callable"
+                            ));
+                        }
+                    }
+                    _ => return Err(anyhow!("unsupported call target in MIR lowering")),
+                };
+
+                let mut effects = BTreeSet::new();
+                let return_ty = if callee_name == "io.out" {
+                    effects.insert("io".to_string());
+                    Type::Void
+                } else {
+                    let Some(sig) = self.checked.functions.get(&callee_name) else {
+                        return Err(anyhow!("unknown function '{}'", callee_name));
+                    };
+                    effects.extend(sig.declared_effects.effects.iter().cloned());
+                    sig.return_type.clone()
+                };
+
+                let args = lowered_args
+                    .into_iter()
+                    .map(|value| value.operand)
+                    .collect::<Vec<_>>();
+
+                if return_ty == Type::Void {
+                    self.emit(
+                        current_bb,
+                        MirInstruction {
+                            dest: None,
+                            ty: Type::Void,
+                            effects,
+                            kind: MirInstructionKind::Call {
+                                callee: callee_name,
+                                args,
+                            },
+                        },
+                    )?;
+                    Ok(LoweredValue::Void)
+                } else {
+                    let temp = self.new_temp(return_ty.clone());
+                    self.emit(
+                        current_bb,
+                        MirInstruction {
+                            dest: Some(temp.clone()),
+                            ty: return_ty.clone(),
+                            effects,
+                            kind: MirInstructionKind::Call {
+                                callee: callee_name,
+                                args,
+                            },
+                        },
+                    )?;
+                    Ok(LoweredValue::Scalar(TypedOperand {
+                        operand: MirOperand::Local(temp),
+                        ty: return_ty,
+                    }))
+                }
+            }
+            ExprKind::Member { base, field } => {
+                let base_value = self.lower_expr(base, current_bb)?;
+                let base = self.expect_scalar(base_value)?;
+                let field_ty = self.resolve_member_type(&base.ty, field)?;
+                let temp = self.new_temp(field_ty.clone());
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(temp.clone()),
+                        ty: field_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::MemberLoad {
+                            base: base.operand,
+                            field: field.clone(),
+                        },
+                    },
+                )?;
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Local(temp),
+                    ty: field_ty,
+                }))
+            }
+            ExprKind::Index { base, index } => {
+                let base_value = self.lower_expr(base, current_bb)?;
+                let base = self.expect_scalar(base_value)?;
+                let index_value = self.lower_expr(index, current_bb)?;
+                let index = self.expect_scalar(index_value)?;
+                let elem_ty = match &base.ty {
+                    Type::Array { inner, .. } => inner.as_ref().clone(),
+                    Type::Str => Type::I32,
+                    other => {
+                        return Err(anyhow!(
+                            "index expression is not supported for type {:?}",
+                            other
+                        ));
+                    }
+                };
+
+                let temp = self.new_temp(elem_ty.clone());
+                self.emit(
+                    current_bb,
+                    MirInstruction {
+                        dest: Some(temp.clone()),
+                        ty: elem_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::IndexLoad {
+                            base: base.operand,
+                            index: index.operand,
+                        },
+                    },
+                )?;
+                Ok(LoweredValue::Scalar(TypedOperand {
+                    operand: MirOperand::Local(temp),
+                    ty: elem_ty,
+                }))
+            }
+        }
+    }
+
+    fn resolve_member_type(&self, base_ty: &Type, field: &str) -> Result<Type> {
+        let named = match base_ty {
+            Type::Named(name) => Some(name.clone()),
+            Type::Ref { inner, .. } => match inner.as_ref() {
+                Type::Named(name) => Some(name.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        if let Some(name) = named {
+            if let Some(struct_info) = self.checked.structs.get(&name) {
+                if let Some(field_ty) = struct_info.fields.get(field) {
+                    return Ok(field_ty.clone());
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "cannot resolve member '{}' for type {:?}",
+            field,
+            base_ty
+        ))
+    }
+
+    fn expect_scalar(&self, value: LoweredValue) -> Result<TypedOperand> {
+        match value {
+            LoweredValue::Scalar(value) => Ok(value),
+            LoweredValue::Range { .. } => Err(anyhow!("expected scalar expression, found range")),
+            LoweredValue::Void => Err(anyhow!("expected scalar expression, found void")),
+        }
+    }
+
+    fn emit(&mut self, block: BlockId, instruction: MirInstruction) -> Result<()> {
+        let Some(block) = self.blocks.get_mut(block) else {
+            return Err(anyhow!("invalid block id {}", block));
+        };
+        if block.terminator.is_some() {
+            return Err(anyhow!("cannot emit instruction after block terminator"));
+        }
+        block.instructions.push(instruction);
+        Ok(())
+    }
+
+    fn set_terminator(&mut self, block_id: BlockId, terminator: MirTerminator) -> Result<()> {
+        let Some(block) = self.blocks.get_mut(block_id) else {
+            return Err(anyhow!("invalid block id {}", block_id));
+        };
+        if block.terminator.is_some() {
+            return Err(anyhow!("block '{}' already has terminator", block.label));
+        }
+        block.terminator = Some(terminator);
+        Ok(())
+    }
+
+    fn new_block(&mut self, label_prefix: &str) -> BlockId {
+        let id = self.blocks.len();
+        self.blocks.push(MirBlockBuilder {
+            label: format!("{label_prefix}.{id}"),
+            instructions: Vec::new(),
+            terminator: None,
+        });
+        id
+    }
+
+    fn new_temp(&mut self, ty: Type) -> String {
+        let name = format!("__t{}", self.next_temp);
+        self.next_temp += 1;
+        self.local_types.insert(name.clone(), ty);
+        name
+    }
+
+    fn define_local_with_exact_name(&mut self, source_name: &str, ty: Type) -> Result<String> {
+        if self.local_types.contains_key(source_name) {
+            return self.define_local(source_name, ty);
+        }
+
+        self.local_types.insert(source_name.to_string(), ty);
+        self.scopes
+            .last_mut()
+            .ok_or_else(|| anyhow!("missing scope while defining local"))?
+            .insert(source_name.to_string(), source_name.to_string());
+        Ok(source_name.to_string())
+    }
+
+    fn define_local(&mut self, source_name: &str, ty: Type) -> Result<String> {
+        let mut candidate = source_name.to_string();
+        if self.local_types.contains_key(&candidate) {
+            candidate = format!("{source_name}#{}", self.next_local);
+            self.next_local += 1;
+        }
+
+        self.local_types.insert(candidate.clone(), ty);
+        self.scopes
+            .last_mut()
+            .ok_or_else(|| anyhow!("missing scope while defining local"))?
+            .insert(source_name.to_string(), candidate.clone());
+        Ok(candidate)
+    }
+
+    fn define_hidden_local(&mut self, prefix: &str, ty: Type) -> Result<String> {
+        let name = format!("{prefix}.{}", self.next_local);
+        self.next_local += 1;
+        self.local_types.insert(name.clone(), ty);
+        Ok(name)
+    }
+
+    fn lookup_local(&self, source_name: &str) -> Result<(String, Type)> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(storage) = scope.get(source_name) {
+                let ty = self
+                    .local_types
+                    .get(storage)
+                    .ok_or_else(|| anyhow!("missing type for local '{}'", storage))?
+                    .clone();
+                return Ok((storage.clone(), ty));
+            }
+        }
+
+        Err(anyhow!("unknown local variable '{}'", source_name))
+    }
+}
+
+fn lower_type_syntax_no_ctx(syntax: &TypeSyntax) -> Type {
+    match syntax {
+        TypeSyntax::Void => Type::Void,
+        TypeSyntax::Named(name) => lower_named_type(name),
+        TypeSyntax::Ref {
+            region,
+            mutable,
+            inner,
+        } => Type::Ref {
+            region: region.clone(),
+            mutable: *mutable,
+            inner: Box::new(lower_type_syntax_no_ctx(inner)),
+        },
+        TypeSyntax::Array { inner, size } => Type::Array {
+            inner: Box::new(lower_type_syntax_no_ctx(inner)),
+            size: *size,
+        },
+    }
+}
+
+fn lower_named_type(name: &str) -> Type {
+    match name {
+        "void" => Type::Void,
+        "bool" => Type::Bool,
+        "i64" => Type::I64,
+        "i32" => Type::I32,
+        "i8" => Type::I8,
+        "u64" => Type::U64,
+        "u32" => Type::U32,
+        "f64" => Type::F64,
+        "f32" => Type::F32,
+        "str" => Type::Str,
+        _ => Type::Named(name.to_string()),
+    }
+}
+
+fn infer_int_type(value: &str) -> Type {
+    if value.ends_with("us") {
+        return Type::U32;
+    }
+    if value.ends_with('u') {
+        return Type::U64;
+    }
+    if value.ends_with('s') {
+        return Type::I32;
+    }
+    if value.ends_with('c') {
+        return Type::I8;
+    }
+    Type::I64
+}
+
+fn infer_float_type(value: &str) -> Type {
+    if value.ends_with('f') {
+        return Type::F32;
+    }
+    Type::F64
+}
+
+fn parse_int_literal(text: &str) -> Result<i64> {
+    let numeric: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '_')
+        .filter(|c| *c != '_')
+        .collect();
+    numeric
+        .parse::<i64>()
+        .map_err(|e| anyhow!("invalid integer literal '{}': {}", text, e))
+}
+
+fn parse_float_literal(text: &str) -> Result<f64> {
+    let normalized: String = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || matches!(*c, '.' | 'e' | 'E' | '+' | '-' | '_'))
+        .filter(|c| *c != '_')
+        .collect();
+    normalized
+        .parse::<f64>()
+        .map_err(|e| anyhow!("invalid float literal '{}': {}", text, e))
+}
+
+fn default_value_for_type(ty: &Type) -> MirOperand {
+    match ty {
+        Type::Bool => MirOperand::Const(MirConst::Bool(false)),
+        Type::F64 => MirOperand::Const(MirConst::Float(0.0, Type::F64)),
+        Type::F32 => MirOperand::Const(MirConst::Float(0.0, Type::F32)),
+        Type::I64 => MirOperand::Const(MirConst::Int(0, Type::I64)),
+        Type::I32 => MirOperand::Const(MirConst::Int(0, Type::I32)),
+        Type::I8 => MirOperand::Const(MirConst::Int(0, Type::I8)),
+        Type::U64 => MirOperand::Const(MirConst::Int(0, Type::U64)),
+        Type::U32 => MirOperand::Const(MirConst::Int(0, Type::U32)),
+        _ => MirOperand::Const(MirConst::Int(0, Type::I64)),
+    }
+}
+
+fn int_one_for_type(ty: &Type) -> MirOperand {
+    match ty {
+        Type::I64 => MirOperand::Const(MirConst::Int(1, Type::I64)),
+        Type::I32 => MirOperand::Const(MirConst::Int(1, Type::I32)),
+        Type::I8 => MirOperand::Const(MirConst::Int(1, Type::I8)),
+        Type::U64 => MirOperand::Const(MirConst::Int(1, Type::U64)),
+        Type::U32 => MirOperand::Const(MirConst::Int(1, Type::U32)),
+        _ => MirOperand::Const(MirConst::Int(1, Type::I64)),
+    }
+}
+
+fn binary_result_type(op: BinaryOp, lhs_ty: &Type) -> Type {
+    match op {
+        BinaryOp::Eq
+        | BinaryOp::Ne
+        | BinaryOp::Lt
+        | BinaryOp::Lte
+        | BinaryOp::Gt
+        | BinaryOp::Gte
+        | BinaryOp::And
+        | BinaryOp::Or => Type::Bool,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+            lhs_ty.clone()
+        }
+        BinaryOp::Range => Type::Range(Box::new(lhs_ty.clone())),
+    }
+}
+
+fn fold_unary_constant(op: UnaryOp, operand: &MirOperand) -> Option<MirConst> {
+    match (op, operand) {
+        (UnaryOp::Not, MirOperand::Const(MirConst::Bool(value))) => Some(MirConst::Bool(!value)),
+        (UnaryOp::Neg, MirOperand::Const(MirConst::Int(value, ty))) => {
+            Some(MirConst::Int(-value, ty.clone()))
+        }
+        (UnaryOp::Neg, MirOperand::Const(MirConst::Float(value, ty))) => {
+            Some(MirConst::Float(-value, ty.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn fold_binary_constant(op: BinaryOp, lhs: &MirOperand, rhs: &MirOperand) -> Option<MirConst> {
+    match (lhs, rhs) {
+        (MirOperand::Const(MirConst::Int(l, ty_l)), MirOperand::Const(MirConst::Int(r, _))) => {
+            let folded = match op {
+                BinaryOp::Add => return Some(MirConst::Int(l + r, ty_l.clone())),
+                BinaryOp::Sub => return Some(MirConst::Int(l - r, ty_l.clone())),
+                BinaryOp::Mul => return Some(MirConst::Int(l * r, ty_l.clone())),
+                BinaryOp::Div => return Some(MirConst::Int(l / r, ty_l.clone())),
+                BinaryOp::Rem => return Some(MirConst::Int(l % r, ty_l.clone())),
+                BinaryOp::Eq => MirConst::Bool(l == r),
+                BinaryOp::Ne => MirConst::Bool(l != r),
+                BinaryOp::Lt => MirConst::Bool(l < r),
+                BinaryOp::Lte => MirConst::Bool(l <= r),
+                BinaryOp::Gt => MirConst::Bool(l > r),
+                BinaryOp::Gte => MirConst::Bool(l >= r),
+                BinaryOp::And => MirConst::Bool((*l != 0) && (*r != 0)),
+                BinaryOp::Or => MirConst::Bool((*l != 0) || (*r != 0)),
+                BinaryOp::Range => return None,
+            };
+            Some(folded)
+        }
+        (
+            MirOperand::Const(MirConst::Float(l, ty_l)),
+            MirOperand::Const(MirConst::Float(r, _)),
+        ) => {
+            let folded = match op {
+                BinaryOp::Add => return Some(MirConst::Float(l + r, ty_l.clone())),
+                BinaryOp::Sub => return Some(MirConst::Float(l - r, ty_l.clone())),
+                BinaryOp::Mul => return Some(MirConst::Float(l * r, ty_l.clone())),
+                BinaryOp::Div => return Some(MirConst::Float(l / r, ty_l.clone())),
+                BinaryOp::Rem => return Some(MirConst::Float(l % r, ty_l.clone())),
+                BinaryOp::Eq => MirConst::Bool((l - r).abs() < f64::EPSILON),
+                BinaryOp::Ne => MirConst::Bool((l - r).abs() >= f64::EPSILON),
+                BinaryOp::Lt => MirConst::Bool(l < r),
+                BinaryOp::Lte => MirConst::Bool(l <= r),
+                BinaryOp::Gt => MirConst::Bool(l > r),
+                BinaryOp::Gte => MirConst::Bool(l >= r),
+                BinaryOp::And | BinaryOp::Or | BinaryOp::Range => return None,
+            };
+            Some(folded)
+        }
+        (MirOperand::Const(MirConst::Bool(l)), MirOperand::Const(MirConst::Bool(r))) => {
+            match op {
+                BinaryOp::And => Some(MirConst::Bool(*l && *r)),
+                BinaryOp::Or => Some(MirConst::Bool(*l || *r)),
+                BinaryOp::Eq => Some(MirConst::Bool(l == r)),
+                BinaryOp::Ne => Some(MirConst::Bool(l != r)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn constant_fold_function(function: &mut MirFunction) {
+    for block in &mut function.blocks {
+        let mut constants = BTreeMap::<String, MirConst>::new();
+
+        for instruction in &mut block.instructions {
+            rewrite_instruction_operands(instruction, &constants);
+            fold_instruction(instruction);
+
+            if let Some(dest) = &instruction.dest {
+                if let MirInstructionKind::Copy(MirOperand::Const(constant)) = &instruction.kind {
+                    constants.insert(dest.clone(), constant.clone());
+                } else {
+                    constants.remove(dest);
+                }
+            }
+        }
+
+        if let MirTerminator::Branch {
+            cond,
+            then_bb,
+            else_bb,
+        } = &block.terminator
+        {
+            let rewritten = substitute_operand(cond, &constants);
+            match rewritten {
+                MirOperand::Const(MirConst::Bool(true)) => {
+                    block.terminator = MirTerminator::Goto(*then_bb);
+                }
+                MirOperand::Const(MirConst::Bool(false)) => {
+                    block.terminator = MirTerminator::Goto(*else_bb);
+                }
+                other => {
+                    block.terminator = MirTerminator::Branch {
+                        cond: other,
+                        then_bb: *then_bb,
+                        else_bb: *else_bb,
+                    };
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_instruction_operands(
+    instruction: &mut MirInstruction,
+    constants: &BTreeMap<String, MirConst>,
+) {
+    match &mut instruction.kind {
+        MirInstructionKind::Copy(operand) => {
+            *operand = substitute_operand(operand, constants);
+        }
+        MirInstructionKind::Unary { operand, .. } => {
+            *operand = substitute_operand(operand, constants);
+        }
+        MirInstructionKind::Binary { lhs, rhs, .. } => {
+            *lhs = substitute_operand(lhs, constants);
+            *rhs = substitute_operand(rhs, constants);
+        }
+        MirInstructionKind::Call { args, .. } => {
+            for arg in args {
+                *arg = substitute_operand(arg, constants);
+            }
+        }
+        MirInstructionKind::MemberLoad { base, .. } => {
+            *base = substitute_operand(base, constants);
+        }
+        MirInstructionKind::IndexLoad { base, index } => {
+            *base = substitute_operand(base, constants);
+            *index = substitute_operand(index, constants);
+        }
+    }
+}
+
+fn fold_instruction(instruction: &mut MirInstruction) {
+    match &instruction.kind {
+        MirInstructionKind::Unary { op, operand } => {
+            if let Some(constant) = fold_unary_constant(*op, operand) {
+                instruction.kind = MirInstructionKind::Copy(MirOperand::Const(constant));
+            }
+        }
+        MirInstructionKind::Binary { op, lhs, rhs } => {
+            if let Some(constant) = fold_binary_constant(*op, lhs, rhs) {
+                instruction.kind = MirInstructionKind::Copy(MirOperand::Const(constant));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn substitute_operand(operand: &MirOperand, constants: &BTreeMap<String, MirConst>) -> MirOperand {
+    match operand {
+        MirOperand::Local(local) => constants
+            .get(local)
+            .cloned()
+            .map(MirOperand::Const)
+            .unwrap_or_else(|| MirOperand::Local(local.clone())),
+        MirOperand::Const(constant) => MirOperand::Const(constant.clone()),
+    }
+}
+
+fn eliminate_dead_branches(function: &mut MirFunction) {
+    if function.blocks.is_empty() {
+        return;
+    }
+
+    let mut reachable = BTreeSet::new();
+    collect_reachable(function.entry, &function.blocks, &mut reachable);
+
+    if reachable.len() == function.blocks.len() {
+        return;
+    }
+
+    let mut remap = BTreeMap::new();
+    let mut new_blocks = Vec::new();
+
+    for old_block in &function.blocks {
+        if reachable.contains(&old_block.id) {
+            let new_id = new_blocks.len();
+            remap.insert(old_block.id, new_id);
+            new_blocks.push(old_block.clone());
+        }
+    }
+
+    for block in &mut new_blocks {
+        block.id = *remap.get(&block.id).expect("reachable block remap exists");
+        block.terminator = remap_terminator(&block.terminator, &remap);
+    }
+
+    function.entry = *remap
+        .get(&function.entry)
+        .expect("entry block remains reachable");
+    function.blocks = new_blocks;
+}
+
+fn collect_reachable(block_id: BlockId, blocks: &[MirBlock], reachable: &mut BTreeSet<BlockId>) {
+    if !reachable.insert(block_id) {
+        return;
+    }
+
+    let Some(block) = blocks.get(block_id) else {
+        return;
+    };
+
+    match block.terminator {
+        MirTerminator::Goto(next) => collect_reachable(next, blocks, reachable),
+        MirTerminator::Branch {
+            then_bb, else_bb, ..
+        } => {
+            collect_reachable(then_bb, blocks, reachable);
+            collect_reachable(else_bb, blocks, reachable);
+        }
+        MirTerminator::Return(_) | MirTerminator::Unreachable => {}
+    }
+}
+
+fn remap_terminator(terminator: &MirTerminator, remap: &BTreeMap<BlockId, BlockId>) -> MirTerminator {
+    match terminator {
+        MirTerminator::Goto(target) => MirTerminator::Goto(*remap.get(target).expect("valid remap")),
+        MirTerminator::Branch {
+            cond,
+            then_bb,
+            else_bb,
+        } => MirTerminator::Branch {
+            cond: cond.clone(),
+            then_bb: *remap.get(then_bb).expect("valid remap"),
+            else_bb: *remap.get(else_bb).expect("valid remap"),
+        },
+        MirTerminator::Return(value) => MirTerminator::Return(value.clone()),
+        MirTerminator::Unreachable => MirTerminator::Unreachable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{lexer, parser, sema};
+
+    use super::*;
+
+    #[test]
+    fn lowers_to_cfg_mir_and_folds_constants() {
+        let src = r#"
+fn main() -> i64
+    effects(none)
+{
+    let x = 1 + 2
+    if true {
+        return x
+    } else {
+        return 0
+    }
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+        let (ast, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+        let (checked, sema_diags) = sema::check(&ast);
+        assert!(!sema_diags.has_errors());
+
+        let mut mir = lower(&ast, &checked).expect("mir lowering should succeed");
+        optimize(&mut mir);
+
+        let main_fn = mir.functions.get("main").expect("main function present");
+        assert!(!main_fn.blocks.is_empty());
+        assert!(main_fn.blocks.len() <= 3);
+    }
+}

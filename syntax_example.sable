@@ -1,0 +1,102 @@
+import io
+
+// Import with inferred effects; sandbox ensures no syscalls escape
+extern "C" fn fast_inverse_sqrt(n: f32) -> f32
+    effects(none)
+    @verify
+
+fn compute_lighting(dir: f32x3, normal: f32x3) -> f32
+    effects(none)
+{
+    let dot = dir.x * normal.x + dir.y * normal.y + dir.z * normal.z
+    
+    // Sandbox provides a restricted execution wrapper for FFI
+    return sandbox { 
+        fast_inverse_sqrt(dot) 
+    }
+}
+
+// Transform to parallel arrays for cache-friendly processing
+@layout(SoA)
+@cache(line = 64)
+struct PhysicsObject {
+    pos: f32x3
+    vel: f32x3
+    mass: f32
+}
+
+// Deterministic simulation bound to a specific memory region
+@deterministic
+fn update_physics(ref<frame> obj: PhysicsObject, dt: f32) 
+    effects(mut) 
+{
+    obj.pos += obj.vel * dt
+    
+    // Explicit mutation of a region-bounded reference
+    if obj.pos.y < 0.0 {
+        obj.vel.y *= -0.5 
+    }
+}
+
+// Function declaring potential failure and I/O effects
+fn load_asset(id: u64) -> Asset
+    effects(io, alloc, raise(AssetError))
+{
+    let path = get_path_for_id(id)
+    if !path.exists() {
+        raise AssetError.NotFound
+    }
+    return Asset.load(path)
+}
+
+fn parallel_init(ids: [u64; 2])
+    effects(io, alloc, raise(AssetError))
+{
+    // Tasks are bound to lexical scope; must complete before exit
+    try {
+        spawn(fn() => load_asset(ids[0]))
+        spawn(fn() => load_asset(ids[1]))
+    } catch (e: AssetError) {
+        // Handling removes the error from the effect set
+        log_error("Failed to batch load: ", e)
+    }
+}
+
+@hot
+fn render_loop(ref<frame> scene: SceneData)
+    effects(mut, io)
+{
+    // The compiler enforces identical signatures for hot reloading
+    for entity in scene.entities {
+        draw_mesh(entity.mesh, entity.transform)
+    }
+    
+    // No global mutation or 'unsafe' allowed in @hot functions
+    if scene.debug_overlay {
+        draw_stats(scene.perf_counters)
+    }
+}
+
+fn main() 
+// for simplicity 
+effects(all)
+{
+    for i in 0..100 {
+        io.out(i)
+    }
+    let a = 1 // i64 
+    let b = 1.0 // f64
+    let c = 1u // u64
+    let d = 1s // i32
+    let e = 1.0f // f32
+    let f = 1.0us // u32
+    let g = 1c // i8
+
+    while a < 10 {
+        io.out(a++)
+    }
+    let s = "hello"
+    for i in s {
+        io.out(i)
+    }
+}

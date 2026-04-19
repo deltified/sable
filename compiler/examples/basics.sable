@@ -1,0 +1,23 @@
+fn add(a: i64, b: i64) -> i64
+    effects(none)
+{
+    return a + b
+}
+
+fn main() -> i64
+    effects(none)
+{
+    let sum = 0
+    let i = 0
+
+    while i < 10 {
+        i += 1
+    }
+
+    for k in 0..10 {
+        let t = add(k, sum)
+        sum = t
+    }
+
+    return sum
+}
