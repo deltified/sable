@@ -106,7 +106,14 @@ impl EffectSet {
 
 #[derive(Debug, Clone)]
 pub struct StructInfo {
-    pub fields: BTreeMap<String, Type>,
+    pub fields: Vec<StructFieldInfo>,
+    pub field_indices: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructFieldInfo {
+    pub name: String,
+    pub ty: Type,
 }
 
 #[derive(Debug, Clone)]
@@ -162,9 +169,10 @@ impl<'a> Checker<'a> {
             return;
         }
 
-        let mut fields = BTreeMap::new();
+        let mut fields = Vec::with_capacity(decl.fields.len());
+        let mut field_indices = BTreeMap::new();
         for field in &decl.fields {
-            if fields.contains_key(&field.name) {
+            if field_indices.contains_key(&field.name) {
                 self.diagnostics.error(
                     "SEM002",
                     format!("duplicate field '{}' in struct '{}'", field.name, decl.name),
@@ -172,12 +180,23 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
-            fields.insert(field.name.clone(), self.lower_type(&field.ty));
+
+            let lowered_ty = self.lower_type(&field.ty);
+            let index = fields.len();
+            fields.push(StructFieldInfo {
+                name: field.name.clone(),
+                ty: lowered_ty,
+            });
+            field_indices.insert(field.name.clone(), index);
         }
 
-        self.checked
-            .structs
-            .insert(decl.name.clone(), StructInfo { fields });
+        self.checked.structs.insert(
+            decl.name.clone(),
+            StructInfo {
+                fields,
+                field_indices,
+            },
+        );
     }
 
     fn collect_function_signature(&mut self, decl: &FunctionDecl) {
@@ -238,6 +257,7 @@ impl<'a> Checker<'a> {
                     declared_return: sig.return_type.clone(),
                     used_effects: EffectSet::default(),
                     current_function: function.name.clone(),
+                    loop_depth: 0,
                 };
 
                 for (param_decl, ty) in function.params.iter().zip(sig.params.iter()) {
@@ -320,6 +340,7 @@ struct FunctionChecker<'a> {
     declared_return: Type,
     used_effects: EffectSet,
     current_function: String,
+    loop_depth: usize,
 }
 
 impl<'a> FunctionChecker<'a> {
@@ -425,7 +446,9 @@ impl<'a> FunctionChecker<'a> {
                     self.diagnostics
                         .error("SEM014", "while condition must be bool", Some(*span));
                 }
+                self.loop_depth += 1;
                 self.check_block(body);
+                self.loop_depth = self.loop_depth.saturating_sub(1);
             }
             Stmt::For {
                 name,
@@ -436,12 +459,30 @@ impl<'a> FunctionChecker<'a> {
                 let iter_ty = self.check_expr(iterable);
                 let elem_ty = match iter_ty {
                     Type::Range(inner) => *inner,
-                    Type::Array { inner, .. } => *inner,
-                    Type::Str => Type::I32,
+                    Type::Array {
+                        inner,
+                        size: Some(_),
+                    } => *inner,
+                    Type::Array { size: None, .. } => {
+                        self.diagnostics.error(
+                            "SEM018",
+                            "for-loop over unsized array is not supported yet",
+                            Some(*span),
+                        );
+                        Type::Unknown
+                    }
+                    Type::Str => {
+                        self.diagnostics.error(
+                            "SEM019",
+                            "for-loop over string is not supported yet",
+                            Some(*span),
+                        );
+                        Type::Unknown
+                    }
                     _ => {
                         self.diagnostics.error(
                             "SEM015",
-                            "for-loop iterable must be range, array, or string",
+                            "for-loop iterable must be range or fixed-size array",
                             Some(*span),
                         );
                         Type::Unknown
@@ -453,12 +494,31 @@ impl<'a> FunctionChecker<'a> {
                     .last_mut()
                     .expect("scope exists")
                     .insert(name.clone(), elem_ty);
+                self.loop_depth += 1;
                 for stmt in &body.statements {
                     self.check_stmt(stmt);
                 }
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 self.locals.pop();
             }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(span) => {
+                if self.loop_depth == 0 {
+                    self.diagnostics.error(
+                        "SEM016",
+                        "'break' is only valid inside loops",
+                        Some(*span),
+                    );
+                }
+            }
+            Stmt::Continue(span) => {
+                if self.loop_depth == 0 {
+                    self.diagnostics.error(
+                        "SEM017",
+                        "'continue' is only valid inside loops",
+                        Some(*span),
+                    );
+                }
+            }
             Stmt::Expr { expr, .. } => {
                 self.check_expr(expr);
             }
@@ -780,8 +840,8 @@ impl<'a> FunctionChecker<'a> {
 
         if let Type::Named(name) = base_ty {
             if let Some(struct_info) = self.structs.get(name) {
-                if let Some(ty) = struct_info.fields.get(field) {
-                    return ty.clone();
+                if let Some(index) = struct_info.field_indices.get(field) {
+                    return struct_info.fields[*index].ty.clone();
                 }
                 self.diagnostics.error(
                     "SEM053",
@@ -922,5 +982,28 @@ fn caller() -> i64
 
         let (_, sema_diags) = check(&module);
         assert!(sema_diags.has_errors());
+    }
+
+    #[test]
+    fn rejects_break_and_continue_outside_loops() {
+        let src = r#"
+fn bad() -> void
+    effects(none)
+{
+    break
+    continue
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (_, sema_diags) = check(&module);
+        assert!(sema_diags.has_errors());
+        assert!(sema_diags.iter().any(|diag| diag.code == "SEM016"));
+        assert!(sema_diags.iter().any(|diag| diag.code == "SEM017"));
     }
 }

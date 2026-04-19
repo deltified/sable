@@ -1,0 +1,16 @@
+struct Pair {
+    left: i64,
+    right: i64,
+}
+
+fn left_of(p: Pair) -> i64
+    effects(none)
+{
+    return p.left
+}
+
+fn main() -> i64
+    effects(none)
+{
+    return 0
+}

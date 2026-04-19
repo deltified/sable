@@ -1,11 +1,11 @@
-# Sable Bootstrap Compiler (Inkwell Backend)
+# Sable Bootstrap Compiler
 
 This is an initial compiler implementation aligned to the Sable v2.0 direction:
 - deterministic frontend ordering primitives
 - explicit effect declarations in signatures
 - semantic checking for core language constructs
 - typed MIR between sema and backend
-- LLVM IR emission through Inkwell
+- optional LLVM IR emission through Inkwell (`llvm-backend` feature)
 
 ## Current Scope
 
@@ -32,7 +32,8 @@ Implemented baseline features:
   - CFG-based MIR with explicit blocks and terminators
   - typed MIR instructions for copies, unary/binary ops, calls, and control-flow lowering
   - deterministic pass pipeline (`constant_fold` -> dead-branch/dead-block elimination)
-- LLVM IR codegen (Inkwell) for baseline numeric/control-flow subset
+- LLVM IR codegen (Inkwell) for baseline numeric/control-flow subset when `llvm-backend` is enabled
+- LLVM IR lowering for array index loads and struct member loads in the current subset
 
 ## Not Yet Implemented
 
@@ -46,11 +47,46 @@ Advanced Sable features are intentionally partial in this first slice, including
 
 ## Build
 
-LLVM 22 is expected locally.
+Default build (frontend + sema + MIR) does not require a local LLVM install.
 
 ```bash
 cargo check
 cargo test
+```
+
+Enable LLVM IR backend explicitly when needed:
+
+```bash
+cargo check --features llvm-backend
+cargo run --features llvm-backend -- ir examples/basics.sable
+```
+
+## Windows notes
+
+Windows now works out of the box for non-IR commands (`tokens`, `ast`, `check`, `mir`) without LLVM.
+
+To use the `ir` command on Windows, install a compatible LLVM 22 toolchain and point `llvm-sys` to it via `LLVM_SYS_221_PREFIX` if needed.
+
+For this repository's current Windows setup, this works:
+
+```powershell
+$env:LLVM_SYS_221_PREFIX = "C:\Program Files\LLVM"
+cargo run --features llvm-backend -- ir examples/basics.sable
+cargo run --features llvm-backend -- ir examples/array_for.sable
+```
+
+- Recommended: install LLVM (for example via Chocolatey):
+
+```powershell
+choco install llvm
+```
+
+- Or install `llvmenv` and use it to provide a local LLVM copy for building:
+
+```powershell
+cargo install llvmenv
+llvmenv install 22
+llvmenv activate 22
 ```
 
 ## CLI
@@ -63,10 +99,14 @@ cargo run -- mir <file.sable>
 cargo run -- ir <file.sable>
 ```
 
+The `ir` command requires `--features llvm-backend`.
+
 ## Baseline Example
 
 A core-feature example is provided at:
 - examples/basics.sable
+- examples/array_for.sable
+- examples/struct_param_member.sable
 
 Generate IR:
 

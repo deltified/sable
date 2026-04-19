@@ -11,7 +11,21 @@ pub type BlockId = usize;
 
 #[derive(Debug, Clone, Default)]
 pub struct MirProgram {
+    pub structs: BTreeMap<String, MirStruct>,
     pub functions: BTreeMap<String, MirFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirStruct {
+    pub name: String,
+    pub fields: Vec<MirStructField>,
+    pub field_indices: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirStructField {
+    pub name: String,
+    pub ty: Type,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +115,26 @@ pub enum MirConst {
 
 pub fn lower(module: &Module, checked: &CheckedProgram) -> Result<MirProgram> {
     let mut program = MirProgram::default();
+
+    for (name, struct_info) in &checked.structs {
+        let fields = struct_info
+            .fields
+            .iter()
+            .map(|field| MirStructField {
+                name: field.name.clone(),
+                ty: field.ty.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        program.structs.insert(
+            name.clone(),
+            MirStruct {
+                name: name.clone(),
+                fields,
+                field_indices: struct_info.field_indices.clone(),
+            },
+        );
+    }
 
     for item in &module.items {
         let crate::ast::Item::Function(function) = item else {
@@ -444,110 +478,20 @@ impl<'a> MirLowerer<'a> {
                 ..
             } => {
                 let lowered_iterable = self.lower_expr(iterable, current_bb)?;
-                let LoweredValue::Range {
-                    start,
-                    end,
-                    elem_ty,
-                } = lowered_iterable
-                else {
-                    return Err(anyhow!(
-                        "for-loop iterable must lower to range in function '{}'",
+                match lowered_iterable {
+                    LoweredValue::Range {
+                        start,
+                        end,
+                        elem_ty,
+                    } => self.lower_for_range(name, body, current_bb, start, end, elem_ty),
+                    LoweredValue::Scalar(iterable) => {
+                        self.lower_for_scalar_iterable(name, body, current_bb, iterable)
+                    }
+                    LoweredValue::Void => Err(anyhow!(
+                        "for-loop iterable cannot be a void expression in '{}'",
                         self.ast_function.name
-                    ));
-                };
-
-                let iter_local = self.define_hidden_local("__for_iter", elem_ty.clone())?;
-                let end_local = self.define_hidden_local("__for_end", elem_ty.clone())?;
-
-                self.emit(
-                    current_bb,
-                    MirInstruction {
-                        dest: Some(iter_local.clone()),
-                        ty: elem_ty.clone(),
-                        effects: BTreeSet::new(),
-                        kind: MirInstructionKind::Copy(start.operand),
-                    },
-                )?;
-                self.emit(
-                    current_bb,
-                    MirInstruction {
-                        dest: Some(end_local.clone()),
-                        ty: elem_ty.clone(),
-                        effects: BTreeSet::new(),
-                        kind: MirInstructionKind::Copy(end.operand),
-                    },
-                )?;
-
-                let cond_bb = self.new_block("for.cond");
-                let body_bb = self.new_block("for.body");
-                let step_bb = self.new_block("for.step");
-                let end_bb = self.new_block("for.end");
-
-                self.set_terminator(current_bb, MirTerminator::Goto(cond_bb))?;
-
-                let cond_temp = self.new_temp(Type::Bool);
-                self.emit(
-                    cond_bb,
-                    MirInstruction {
-                        dest: Some(cond_temp.clone()),
-                        ty: Type::Bool,
-                        effects: BTreeSet::new(),
-                        kind: MirInstructionKind::Binary {
-                            op: BinaryOp::Lt,
-                            lhs: MirOperand::Local(iter_local.clone()),
-                            rhs: MirOperand::Local(end_local.clone()),
-                        },
-                    },
-                )?;
-                self.set_terminator(
-                    cond_bb,
-                    MirTerminator::Branch {
-                        cond: MirOperand::Local(cond_temp),
-                        then_bb: body_bb,
-                        else_bb: end_bb,
-                    },
-                )?;
-
-                self.scopes.push(BTreeMap::new());
-                let loop_var = self.define_local(name, elem_ty.clone())?;
-                self.emit(
-                    body_bb,
-                    MirInstruction {
-                        dest: Some(loop_var),
-                        ty: elem_ty.clone(),
-                        effects: BTreeSet::new(),
-                        kind: MirInstructionKind::Copy(MirOperand::Local(iter_local.clone())),
-                    },
-                )?;
-
-                self.loop_stack.push(LoopTargets {
-                    break_bb: end_bb,
-                    continue_bb: step_bb,
-                });
-                let body_tail = self.lower_ast_block(body, body_bb)?;
-                self.loop_stack.pop();
-                self.scopes.pop();
-
-                if let Some(tail) = body_tail {
-                    self.set_terminator(tail, MirTerminator::Goto(step_bb))?;
+                    )),
                 }
-
-                self.emit(
-                    step_bb,
-                    MirInstruction {
-                        dest: Some(iter_local.clone()),
-                        ty: elem_ty.clone(),
-                        effects: BTreeSet::new(),
-                        kind: MirInstructionKind::Binary {
-                            op: BinaryOp::Add,
-                            lhs: MirOperand::Local(iter_local),
-                            rhs: int_one_for_type(&elem_ty),
-                        },
-                    },
-                )?;
-                self.set_terminator(step_bb, MirTerminator::Goto(cond_bb))?;
-
-                Ok(Some(end_bb))
             }
             Stmt::Break(_) => {
                 let Some(targets) = self.loop_stack.last().copied() else {
@@ -569,6 +513,263 @@ impl<'a> MirLowerer<'a> {
             }
             Stmt::Block(block) => self.lower_ast_block(block, current_bb),
         }
+    }
+
+    fn lower_for_range(
+        &mut self,
+        loop_name: &str,
+        body: &Block,
+        current_bb: BlockId,
+        start: TypedOperand,
+        end: TypedOperand,
+        elem_ty: Type,
+    ) -> Result<Option<BlockId>> {
+        let iter_local = self.define_hidden_local("__for_iter", elem_ty.clone())?;
+        let end_local = self.define_hidden_local("__for_end", elem_ty.clone())?;
+
+        self.emit(
+            current_bb,
+            MirInstruction {
+                dest: Some(iter_local.clone()),
+                ty: elem_ty.clone(),
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Copy(start.operand),
+            },
+        )?;
+        self.emit(
+            current_bb,
+            MirInstruction {
+                dest: Some(end_local.clone()),
+                ty: elem_ty.clone(),
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Copy(end.operand),
+            },
+        )?;
+
+        self.lower_for_loop_core(
+            loop_name,
+            body,
+            current_bb,
+            iter_local,
+            end_local,
+            elem_ty.clone(),
+            elem_ty.clone(),
+            |lowerer, body_bb, loop_var, iter_local_name| {
+                lowerer.emit(
+                    body_bb,
+                    MirInstruction {
+                        dest: Some(loop_var),
+                        ty: elem_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::Copy(MirOperand::Local(iter_local_name)),
+                    },
+                )
+            },
+            int_one_for_type(&elem_ty),
+        )
+    }
+
+    fn lower_for_scalar_iterable(
+        &mut self,
+        loop_name: &str,
+        body: &Block,
+        current_bb: BlockId,
+        iterable: TypedOperand,
+    ) -> Result<Option<BlockId>> {
+        let TypedOperand { operand, ty } = iterable;
+
+        match ty {
+            Type::Array {
+                inner,
+                size: Some(size),
+            } => {
+                let elem_ty = inner.as_ref().clone();
+                let array_local = match operand {
+                    MirOperand::Local(local) => local,
+                    value => {
+                        let temp = self.new_temp(Type::Array {
+                            inner: inner.clone(),
+                            size: Some(size),
+                        });
+                        self.emit(
+                            current_bb,
+                            MirInstruction {
+                                dest: Some(temp.clone()),
+                                ty: Type::Array {
+                                    inner,
+                                    size: Some(size),
+                                },
+                                effects: BTreeSet::new(),
+                                kind: MirInstructionKind::Copy(value),
+                            },
+                        )?;
+                        temp
+                    }
+                };
+
+                self.lower_for_fixed_array(loop_name, body, current_bb, array_local, elem_ty, size)
+            }
+            Type::Array { size: None, .. } => Err(anyhow!(
+                "for-loop over unsized arrays is not supported in '{}'",
+                self.ast_function.name
+            )),
+            Type::Str => Err(anyhow!(
+                "for-loop over strings is not supported in '{}'",
+                self.ast_function.name
+            )),
+            other => Err(anyhow!(
+                "for-loop iterable must be range or fixed-size array, got {:?} in '{}'",
+                other,
+                self.ast_function.name
+            )),
+        }
+    }
+
+    fn lower_for_fixed_array(
+        &mut self,
+        loop_name: &str,
+        body: &Block,
+        current_bb: BlockId,
+        array_local: String,
+        elem_ty: Type,
+        size: usize,
+    ) -> Result<Option<BlockId>> {
+        let size_i64 = i64::try_from(size).map_err(|_| {
+            anyhow!(
+                "array length '{}' does not fit i64 in function '{}'",
+                size,
+                self.ast_function.name
+            )
+        })?;
+
+        let iter_local = self.define_hidden_local("__for_idx", Type::I64)?;
+        let end_local = self.define_hidden_local("__for_len", Type::I64)?;
+
+        self.emit(
+            current_bb,
+            MirInstruction {
+                dest: Some(iter_local.clone()),
+                ty: Type::I64,
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Copy(MirOperand::Const(MirConst::Int(0, Type::I64))),
+            },
+        )?;
+        self.emit(
+            current_bb,
+            MirInstruction {
+                dest: Some(end_local.clone()),
+                ty: Type::I64,
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Copy(MirOperand::Const(MirConst::Int(
+                    size_i64,
+                    Type::I64,
+                ))),
+            },
+        )?;
+
+        self.lower_for_loop_core(
+            loop_name,
+            body,
+            current_bb,
+            iter_local,
+            end_local,
+            elem_ty.clone(),
+            Type::I64,
+            |lowerer, body_bb, loop_var, iter_local_name| {
+                lowerer.emit(
+                    body_bb,
+                    MirInstruction {
+                        dest: Some(loop_var),
+                        ty: elem_ty.clone(),
+                        effects: BTreeSet::new(),
+                        kind: MirInstructionKind::IndexLoad {
+                            base: MirOperand::Local(array_local.clone()),
+                            index: MirOperand::Local(iter_local_name),
+                        },
+                    },
+                )
+            },
+            MirOperand::Const(MirConst::Int(1, Type::I64)),
+        )
+    }
+
+    fn lower_for_loop_core<F>(
+        &mut self,
+        loop_name: &str,
+        body: &Block,
+        current_bb: BlockId,
+        iter_local: String,
+        end_local: String,
+        loop_var_ty: Type,
+        iter_ty: Type,
+        init_loop_var: F,
+        step_by: MirOperand,
+    ) -> Result<Option<BlockId>>
+    where
+        F: FnOnce(&mut Self, BlockId, String, String) -> Result<()>,
+    {
+        let cond_bb = self.new_block("for.cond");
+        let body_bb = self.new_block("for.body");
+        let step_bb = self.new_block("for.step");
+        let end_bb = self.new_block("for.end");
+
+        self.set_terminator(current_bb, MirTerminator::Goto(cond_bb))?;
+
+        let cond_temp = self.new_temp(Type::Bool);
+        self.emit(
+            cond_bb,
+            MirInstruction {
+                dest: Some(cond_temp.clone()),
+                ty: Type::Bool,
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Binary {
+                    op: BinaryOp::Lt,
+                    lhs: MirOperand::Local(iter_local.clone()),
+                    rhs: MirOperand::Local(end_local.clone()),
+                },
+            },
+        )?;
+        self.set_terminator(
+            cond_bb,
+            MirTerminator::Branch {
+                cond: MirOperand::Local(cond_temp),
+                then_bb: body_bb,
+                else_bb: end_bb,
+            },
+        )?;
+
+        self.scopes.push(BTreeMap::new());
+        let loop_var = self.define_local(loop_name, loop_var_ty)?;
+        init_loop_var(self, body_bb, loop_var, iter_local.clone())?;
+
+        self.loop_stack.push(LoopTargets {
+            break_bb: end_bb,
+            continue_bb: step_bb,
+        });
+        let body_tail = self.lower_ast_block(body, body_bb)?;
+        self.loop_stack.pop();
+        self.scopes.pop();
+
+        if let Some(tail) = body_tail {
+            self.set_terminator(tail, MirTerminator::Goto(step_bb))?;
+        }
+
+        self.emit(
+            step_bb,
+            MirInstruction {
+                dest: Some(iter_local.clone()),
+                ty: iter_ty,
+                effects: BTreeSet::new(),
+                kind: MirInstructionKind::Binary {
+                    op: BinaryOp::Add,
+                    lhs: MirOperand::Local(iter_local),
+                    rhs: step_by,
+                },
+            },
+        )?;
+        self.set_terminator(step_bb, MirTerminator::Goto(cond_bb))?;
+
+        Ok(Some(end_bb))
     }
 
     fn lower_expr(&mut self, expr: &Expr, current_bb: BlockId) -> Result<LoweredValue> {
@@ -915,8 +1116,8 @@ impl<'a> MirLowerer<'a> {
 
         if let Some(name) = named {
             if let Some(struct_info) = self.checked.structs.get(&name) {
-                if let Some(field_ty) = struct_info.fields.get(field) {
-                    return Ok(field_ty.clone());
+                if let Some(index) = struct_info.field_indices.get(field) {
+                    return Ok(struct_info.fields[*index].ty.clone());
                 }
             }
         }
@@ -1422,5 +1623,40 @@ fn main() -> i64
         let main_fn = mir.functions.get("main").expect("main function present");
         assert!(!main_fn.blocks.is_empty());
         assert!(main_fn.blocks.len() <= 3);
+    }
+
+    #[test]
+    fn lowers_for_loop_over_fixed_array_param() {
+        let src = r#"
+fn sum(values: [i64; 4]) -> i64
+    effects(none)
+{
+    let acc = 0
+    for value in values {
+        acc += value
+    }
+    return acc
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (ast, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (checked, sema_diags) = sema::check(&ast);
+        assert!(!sema_diags.has_errors());
+
+        let mut mir = lower(&ast, &checked).expect("mir lowering should succeed");
+        optimize(&mut mir);
+
+        let sum_fn = mir.functions.get("sum").expect("sum function present");
+        let has_index_load = sum_fn
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .any(|instruction| matches!(instruction.kind, MirInstructionKind::IndexLoad { .. }));
+        assert!(has_index_load, "expected array iteration to emit IndexLoad");
     }
 }
