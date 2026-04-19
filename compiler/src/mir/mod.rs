@@ -1125,7 +1125,7 @@ impl<'a> MirLowerer<'a> {
                 }))
             }
             ExprKind::Call { callee, args } => {
-                let lowered_args = args
+                let mut lowered_args = args
                     .iter()
                     .map(|arg| self.lower_expr(arg, current_bb))
                     .collect::<Result<Vec<_>>>()?
@@ -1137,11 +1137,40 @@ impl<'a> MirLowerer<'a> {
                     ExprKind::Name(name) => name.clone(),
                     ExprKind::Member { base, field } => {
                         if let ExprKind::Name(base_name) = &base.kind {
-                            format!("{base_name}.{field}")
-                        } else {
-                            return Err(anyhow!(
-                                "only direct names and module-style members are callable"
-                            ));
+                            if is_static_builtin_member_call(base_name, field) {
+                                format!("{base_name}.{field}")
+                            } else if is_builtin_namespace_name(base_name) {
+                                return Err(anyhow!(
+                                    "{}.{} must be called on an instance",
+                                    base_name,
+                                    field
+                                ));
+                            } else {
+                                let lowered_base = self.lower_expr(base, current_bb)?;
+                                let base = self.expect_scalar(lowered_base)?;
+                                let Some(namespace) = builtin_namespace_for_type(&base.ty) else {
+                                    return Err(anyhow!(
+                                        "member call '.{}' is not callable for type {:?}",
+                                        field,
+                                        base.ty
+                                    ));
+                                };
+                                lowered_args.insert(0, base);
+                                format!("{namespace}.{field}")
+                            }
+                        }
+                        else {
+                            let lowered_base = self.lower_expr(base, current_bb)?;
+                            let base = self.expect_scalar(lowered_base)?;
+                            let Some(namespace) = builtin_namespace_for_type(&base.ty) else {
+                                return Err(anyhow!(
+                                    "member call '.{}' is not callable for type {:?}",
+                                    field,
+                                    base.ty
+                                ));
+                            };
+                            lowered_args.insert(0, base);
+                            format!("{namespace}.{field}")
                         }
                     }
                     _ => return Err(anyhow!("unsupported call target in MIR lowering")),
@@ -1378,7 +1407,8 @@ impl<'a> MirLowerer<'a> {
                 };
 
                 effects.insert("alloc".to_string());
-                Some(Type::Vec(Box::new(resolved_elem_ty)))
+                let _ = resolved_elem_ty;
+                Some(Type::Void)
             }
             "vec.get" => {
                 if args.len() != 2
@@ -1400,13 +1430,14 @@ impl<'a> MirLowerer<'a> {
                 let Type::Vec(inner) = &args[0].ty else {
                     bail!("vec.remove first argument must be vec<T>");
                 };
-                Some(Type::Vec(inner.clone()))
+                let _ = inner;
+                Some(Type::Void)
             }
             "vec.clear" => {
                 if args.len() != 1 || !matches!(args[0].ty, Type::Vec(_)) {
                     bail!("vec.clear expects one vec<T> argument");
                 }
-                Some(args[0].ty.clone())
+                Some(Type::Void)
             }
             "vec.is_empty" => {
                 if args.len() != 1 || !matches!(args[0].ty, Type::Vec(_)) {
@@ -1834,6 +1865,7 @@ fn lower_named_type(name: &str) -> Type {
         "vec" => Type::Vec(Box::new(Type::Unknown)),
         "map" => Type::Map(Box::new(Type::Unknown), Box::new(Type::Unknown)),
         "ordered_map" => Type::OrderedMap(Box::new(Type::Unknown), Box::new(Type::Unknown)),
+        "ptr" => Type::Ptr(Box::new(Type::Unknown)),
         "vec_i64" => Type::Vec(Box::new(Type::I64)),
         _ => Type::Named(name.to_string()),
     }
@@ -1849,6 +1881,7 @@ where
         "ordered_map" if args.len() == 2 => {
             Type::OrderedMap(Box::new(lower(&args[0])), Box::new(lower(&args[1])))
         }
+        "ptr" if args.len() == 1 => Type::Ptr(Box::new(lower(&args[0]))),
         _ => Type::Unknown,
     }
 }
@@ -1872,9 +1905,40 @@ fn is_orderable_map_key_type(ty: &Type) -> bool {
     is_hashable_map_key_type(ty)
 }
 
+fn is_builtin_namespace_name(name: &str) -> bool {
+    matches!(name, "io" | "str" | "vec" | "map" | "ordered_map")
+}
+
+fn is_static_builtin_member_call(module_name: &str, field: &str) -> bool {
+    matches!(
+        (module_name, field),
+        ("io", "out")
+            | ("vec", "new")
+            | ("vec", "new_i64")
+            | ("vec", "with_capacity")
+            | ("map", "new")
+            | ("map", "with_capacity")
+            | ("ordered_map", "new")
+    )
+}
+
+fn builtin_namespace_for_type(ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Ref { inner, .. } => builtin_namespace_for_type(inner.as_ref()),
+        Type::Str => Some("str"),
+        Type::Vec(_) => Some("vec"),
+        Type::Map(_, _) => Some("map"),
+        Type::OrderedMap(_, _) => Some("ordered_map"),
+        _ => None,
+    }
+}
+
 fn is_assignable_type(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Unknown, _) | (_, Type::Unknown) => true,
+        (Type::Ptr(expected_inner), Type::Ptr(actual_inner)) => {
+            is_assignable_type(expected_inner, actual_inner)
+        }
         (Type::Vec(expected_inner), Type::Vec(actual_inner)) => {
             is_assignable_type(expected_inner, actual_inner)
         }
@@ -1925,6 +1989,9 @@ fn merge_inferred_type(current: &Type, inferred: &Type) -> Type {
     match (current, inferred) {
         (Type::Unknown, other) => other.clone(),
         (other, Type::Unknown) => other.clone(),
+        (Type::Ptr(current_inner), Type::Ptr(inferred_inner)) => Type::Ptr(Box::new(
+            merge_inferred_type(current_inner.as_ref(), inferred_inner.as_ref()),
+        )),
         (Type::Vec(current_inner), Type::Vec(inferred_inner)) => Type::Vec(Box::new(
             merge_inferred_type(current_inner.as_ref(), inferred_inner.as_ref()),
         )),
@@ -2362,8 +2429,8 @@ fn main() -> i32
     }
 
     let values: vec<i32> = vec.new()
-    values = vec.push(values, 1s)
-    values = vec.push(values, 2s)
+    values.push(1s)
+    values.push(2s)
     for value in values {
         total += value
     }
@@ -2395,8 +2462,26 @@ fn main() -> i32
             })
             .collect::<Vec<_>>();
 
+        let has_vec_push_stmt = main_fn
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .any(|instruction| {
+                matches!(
+                    &instruction.kind,
+                    MirInstructionKind::Call { callee, .. }
+                        if callee == "vec.push"
+                            && instruction.dest.is_none()
+                            && instruction.ty == Type::Void
+                )
+            });
+
         assert!(calls.iter().any(|callee| *callee == "str.len"));
         assert!(calls.iter().any(|callee| *callee == "vec.len"));
+        assert!(
+            has_vec_push_stmt,
+            "expected vec.push to lower as a void statement call"
+        );
 
         let index_load_count = main_fn
             .blocks
@@ -2408,5 +2493,35 @@ fn main() -> i32
             index_load_count >= 2,
             "expected both string and vec loops to emit IndexLoad operations"
         );
+    }
+
+    #[test]
+    fn lowers_ptr_signature_types() {
+        let src = r#"
+fn passthrough(p: ptr<i64>) -> ptr<i64>
+    effects(none)
+{
+    return p
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (ast, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (checked, sema_diags) = sema::check(&ast);
+        assert!(!sema_diags.has_errors());
+
+        let mut mir = lower(&ast, &checked).expect("mir lowering should succeed");
+        optimize(&mut mir);
+
+        let passthrough = mir
+            .functions
+            .get("passthrough")
+            .expect("passthrough function present");
+        assert!(matches!(passthrough.params[0].ty, Type::Ptr(_)));
+        assert!(matches!(passthrough.return_type, Type::Ptr(_)));
     }
 }

@@ -3,31 +3,31 @@ fn main() -> i64
 {
     let first = "Hello"
     let second = "Sable"
-    let with_space = str.concat(first, ", ")
+    let with_space = first.concat(", ")
     let message = with_space + second
     io.out(message)
-    io.out(str.contains(message, "Sable"))
-    io.out(str.slice(message, 0, 5))
+    io.out(message.contains("Sable"))
+    io.out(message.slice(0, 5))
 
     let numbers: vec<i64> = vec.new()
-    numbers = vec.push(numbers, 4)
-    numbers = vec.push(numbers, 6)
+    numbers.push(4)
+    numbers.push(6)
 
-    let first_num = vec.get(numbers, 0)
-    let second_num = vec.get(numbers, 1)
+    let first_num = numbers.get(0)
+    let second_num = numbers.get(1)
     let total = first_num + second_num
 
     let fast: map<str, i64> = map.with_capacity(8)
-    fast = map.put(fast, "total", total)
+    fast = fast.put("total", total)
 
     let stable: ordered_map<str, i64> = ordered_map.new()
-    stable = ordered_map.put(stable, "left", 1)
-    stable = ordered_map.put(stable, "right", 2)
+    stable = stable.put("left", 1)
+    stable = stable.put("right", 2)
 
-    let size = vec.len(numbers)
+    let size = numbers.len()
     io.out(size)
-    io.out(map.get(fast, "total"))
-    io.out(ordered_map.len(stable))
+    io.out(fast.get("total"))
+    io.out(stable.len())
 
-    return map.get(fast, "total") + ordered_map.len(stable)
+    return fast.get("total") + stable.len()
 }

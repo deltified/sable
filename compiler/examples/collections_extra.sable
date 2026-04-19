@@ -9,35 +9,35 @@ fn main() -> i32
     }
 
     let values: vec<i32> = vec.new()
-    values = vec.push(values, 10s)
-    values = vec.push(values, 20s)
-    values = vec.push(values, 30s)
+    values.push(10s)
+    values.push(20s)
+    values.push(30s)
 
     for value in values {
         total += value
     }
 
-    values = vec.remove(values, 1)
-    let values_len = vec.len(values)
-    values = vec.clear(values)
+    values.remove(1)
+    let values_len = values.len()
+    values.clear()
 
     let m: map<str, i32> = map.new()
-    m = map.put(m, "a", 1s)
-    m = map.remove(m, "a")
-    m = map.clear(m)
+    m = m.put("a", 1s)
+    m = m.remove("a")
+    m = m.clear()
 
     let om: ordered_map<str, i32> = ordered_map.new()
-    om = ordered_map.put(om, "left", 1s)
-    om = ordered_map.remove(om, "left")
-    om = ordered_map.clear(om)
+    om = om.put("left", 1s)
+    om = om.remove("left")
+    om = om.clear()
 
-    if vec.is_empty(values) {
+    if values.is_empty() {
         total += 2s
     }
-    if map.is_empty(m) {
+    if m.is_empty() {
         total += 4s
     }
-    if ordered_map.is_empty(om) {
+    if om.is_empty() {
         total += 8s
     }
     if values_len == 2 {

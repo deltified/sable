@@ -19,6 +19,7 @@ pub enum Type {
     Vec(Box<Type>),
     Map(Box<Type>, Box<Type>),
     OrderedMap(Box<Type>, Box<Type>),
+    Ptr(Box<Type>),
     Named(String),
     Ref {
         region: Option<String>,
@@ -397,6 +398,17 @@ impl<'a> FunctionChecker<'a> {
                     .map(|expr| self.check_expr(expr))
                     .unwrap_or(Type::Unknown);
 
+                if value.is_some() && value_ty == Type::Void {
+                    self.diagnostics.error(
+                        "SEM071",
+                        format!(
+                            "variable '{}' cannot be initialized from a void expression",
+                            name
+                        ),
+                        Some(*span),
+                    );
+                }
+
                 let final_ty = if let Some(annotation_ty) = annotated {
                     if value.is_some() && !self.is_assignable(&annotation_ty, &value_ty) {
                         self.diagnostics.error(
@@ -747,16 +759,47 @@ impl<'a> FunctionChecker<'a> {
             }
             ExprKind::Member { base, field } => {
                 if let ExprKind::Name(module_name) = &base.kind {
+                    if is_static_builtin_member_call(module_name, field) {
+                        if let Some(ty) =
+                            self.check_builtin_member_call(module_name, field, &arg_types, span)
+                        {
+                            return ty;
+                        }
+                    } else if is_builtin_namespace_name(module_name) {
+                        self.diagnostics.error(
+                            "SEM032",
+                            format!(
+                                "{}.{} must be called on an instance (for example: value.{}(...))",
+                                module_name, field, field
+                            ),
+                            Some(span),
+                        );
+                        return Type::Unknown;
+                    }
+                }
+
+                let receiver_ty = self.check_expr(base);
+                if let Some(namespace) = builtin_namespace_for_type(&receiver_ty) {
+                    let mut method_arg_types = Vec::with_capacity(arg_types.len() + 1);
+                    method_arg_types.push(receiver_ty.clone());
+                    method_arg_types.extend(arg_types.iter().cloned());
+
                     if let Some(ty) =
-                        self.check_builtin_member_call(module_name, field, &arg_types, span)
+                        self.check_builtin_member_call(namespace, field, &method_arg_types, span)
                     {
+                        self.maybe_refine_builtin_receiver_local(
+                            base,
+                            namespace,
+                            field,
+                            &method_arg_types,
+                        );
                         return ty;
                     }
                 }
 
                 self.diagnostics.error(
                     "SEM032",
-                    "unsupported call target; only direct function calls are currently supported",
+                    "unsupported call target; only direct function calls and builtin receiver methods are currently supported",
                     Some(span),
                 );
                 Type::Unknown
@@ -985,7 +1028,8 @@ impl<'a> FunctionChecker<'a> {
                 };
 
                 self.used_effects.add_effect("alloc");
-                Some(Type::Vec(Box::new(resolved_elem_ty)))
+                let _ = resolved_elem_ty;
+                Some(Type::Void)
             }
             ("vec", "get") => {
                 if arg_types.len() != 2 {
@@ -1045,7 +1089,8 @@ impl<'a> FunctionChecker<'a> {
                     return Some(Type::Unknown);
                 };
 
-                Some(Type::Vec(inner.clone()))
+                let _ = inner;
+                Some(Type::Void)
             }
             ("vec", "clear") => {
                 if arg_types.len() != 1 || !matches!(&arg_types[0], Type::Vec(_)) {
@@ -1057,7 +1102,7 @@ impl<'a> FunctionChecker<'a> {
                     return Some(Type::Unknown);
                 }
 
-                Some(arg_types[0].clone())
+                Some(Type::Void)
             }
             ("vec", "is_empty") => {
                 if arg_types.len() != 1 || !matches!(&arg_types[0], Type::Vec(_)) {
@@ -1729,10 +1774,40 @@ impl<'a> FunctionChecker<'a> {
         }
     }
 
+    fn maybe_refine_builtin_receiver_local(
+        &mut self,
+        base: &Expr,
+        namespace: &str,
+        field: &str,
+        method_arg_types: &[Type],
+    ) {
+        if namespace != "vec" || field != "push" || method_arg_types.len() != 2 {
+            return;
+        }
+
+        let ExprKind::Name(local_name) = &base.kind else {
+            return;
+        };
+
+        let Type::Vec(inner) = &method_arg_types[0] else {
+            return;
+        };
+
+        if !is_unknown_type(inner.as_ref()) {
+            return;
+        }
+
+        let refined = Type::Vec(Box::new(method_arg_types[1].clone()));
+        self.update_local_type(local_name, refined);
+    }
+
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
             (Type::Unknown, _) | (_, Type::Unknown) => true,
             (Type::Vec(expected_inner), Type::Vec(actual_inner)) => {
+                self.is_assignable(expected_inner, actual_inner)
+            }
+            (Type::Ptr(expected_inner), Type::Ptr(actual_inner)) => {
                 self.is_assignable(expected_inner, actual_inner)
             }
             (Type::Map(expected_k, expected_v), Type::Map(actual_k, actual_v)) => {
@@ -1795,6 +1870,7 @@ fn lower_named_type(name: &str) -> Type {
         "vec" => Type::Vec(Box::new(Type::Unknown)),
         "map" => Type::Map(Box::new(Type::Unknown), Box::new(Type::Unknown)),
         "ordered_map" => Type::OrderedMap(Box::new(Type::Unknown), Box::new(Type::Unknown)),
+        "ptr" => Type::Ptr(Box::new(Type::Unknown)),
         "vec_i64" => Type::Vec(Box::new(Type::I64)),
         _ => Type::Named(name.to_string()),
     }
@@ -1810,6 +1886,7 @@ where
         "ordered_map" if args.len() == 2 => {
             Type::OrderedMap(Box::new(lower(&args[0])), Box::new(lower(&args[1])))
         }
+        "ptr" if args.len() == 1 => Type::Ptr(Box::new(lower(&args[0]))),
         _ => Type::Unknown,
     }
 }
@@ -1829,8 +1906,39 @@ fn is_orderable_map_key_type(ty: &Type) -> bool {
     is_hashable_map_key_type(ty)
 }
 
+fn is_builtin_namespace_name(name: &str) -> bool {
+    matches!(name, "io" | "str" | "vec" | "map" | "ordered_map")
+}
+
+fn is_static_builtin_member_call(module_name: &str, field: &str) -> bool {
+    matches!(
+        (module_name, field),
+        ("io", "out")
+            | ("vec", "new")
+            | ("vec", "new_i64")
+            | ("vec", "with_capacity")
+            | ("map", "new")
+            | ("map", "with_capacity")
+            | ("ordered_map", "new")
+    )
+}
+
+fn builtin_namespace_for_type(ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Ref { inner, .. } => builtin_namespace_for_type(inner.as_ref()),
+        Type::Str => Some("str"),
+        Type::Vec(_) => Some("vec"),
+        Type::Map(_, _) => Some("map"),
+        Type::OrderedMap(_, _) => Some("ordered_map"),
+        _ => None,
+    }
+}
+
 fn requires_explicit_initializer(ty: &Type) -> bool {
-    matches!(ty, Type::Str | Type::Vec(_) | Type::Map(_, _) | Type::OrderedMap(_, _))
+    matches!(
+        ty,
+        Type::Str | Type::Vec(_) | Type::Map(_, _) | Type::OrderedMap(_, _) | Type::Ptr(_)
+    )
 }
 
 fn merge_inferred_type(current: &Type, inferred: &Type) -> Type {
@@ -1838,6 +1946,9 @@ fn merge_inferred_type(current: &Type, inferred: &Type) -> Type {
         (Type::Unknown, other) => other.clone(),
         (other, Type::Unknown) => other.clone(),
         (Type::Vec(current_inner), Type::Vec(inferred_inner)) => Type::Vec(Box::new(
+            merge_inferred_type(current_inner.as_ref(), inferred_inner.as_ref()),
+        )),
+        (Type::Ptr(current_inner), Type::Ptr(inferred_inner)) => Type::Ptr(Box::new(
             merge_inferred_type(current_inner.as_ref(), inferred_inner.as_ref()),
         )),
         (Type::Map(current_k, current_v), Type::Map(inferred_k, inferred_v)) => Type::Map(
@@ -1974,8 +2085,8 @@ fn stable() -> i64
     effects(alloc)
 {
     let m: map<str, i64> = map.new()
-    m = map.put(m, "x", 1)
-    return map.get(m, "x")
+    m = m.put("x", 1)
+    return m.get("x")
 }
 "#;
 
@@ -1991,14 +2102,15 @@ fn stable() -> i64
     }
 
     #[test]
-    fn allows_constructor_inference_via_assignment() {
+    fn allows_constructor_inference_via_push_statement() {
         let src = r#"
 fn main() -> i64
     effects(alloc)
 {
     let v = vec.new()
-    v = vec.push(v, 7)
-    return vec.get(v, 0)
+    v.push(7)
+    let next = v.get(0) + 1
+    return next
 }
 "#;
 
@@ -2010,6 +2122,33 @@ fn main() -> i64
 
         let (_, sema_diags) = check(&module);
         assert!(!sema_diags.has_errors());
+    }
+
+    #[test]
+    fn rejects_vec_push_assignment_expression_style() {
+        let src = r#"
+fn main() -> i64
+    effects(alloc)
+{
+    let v: vec<i64> = vec.new()
+    v = v.push(1)
+    return 0
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (_, sema_diags) = check(&module);
+        assert!(sema_diags.has_errors());
+        assert!(
+            sema_diags
+                .iter()
+                .any(|diag| diag.code == "SEM023" || diag.code == "SEM071")
+        );
     }
 
     #[test]
@@ -2032,5 +2171,70 @@ fn main() -> i64
         let (_, sema_diags) = check(&module);
         assert!(sema_diags.has_errors());
         assert!(sema_diags.iter().any(|diag| diag.code == "SEM069"));
+    }
+
+    #[test]
+    fn rejects_let_initializer_from_void_call() {
+        let src = r#"
+fn main() -> i64
+    effects(io)
+{
+    let ignored = io.out(1)
+    return 0
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (_, sema_diags) = check(&module);
+        assert!(sema_diags.has_errors());
+        assert!(sema_diags.iter().any(|diag| diag.code == "SEM071"));
+    }
+
+    #[test]
+    fn accepts_ptr_type_baseline() {
+        let src = r#"
+fn passthrough(p: ptr<i64>) -> ptr<i64>
+    effects(none)
+{
+    return p
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (_, sema_diags) = check(&module);
+        assert!(!sema_diags.has_errors());
+    }
+
+    #[test]
+    fn rejects_legacy_static_operation_call_style() {
+        let src = r#"
+fn main() -> i64
+    effects(alloc)
+{
+    let v: vec<i64> = vec.new()
+    v = vec.push(v, 1)
+    return 0
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (_, sema_diags) = check(&module);
+        assert!(sema_diags.has_errors());
+        assert!(sema_diags.iter().any(|diag| diag.code == "SEM032"));
     }
 }

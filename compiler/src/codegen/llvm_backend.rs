@@ -1016,6 +1016,7 @@ impl<'ctx> Codegen<'ctx> {
             | Type::Vec(_)
             | Type::Map(_, _)
             | Type::OrderedMap(_, _)
+            | Type::Ptr(_)
             | Type::Unknown => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Named(name) => self.struct_types.get(name).copied()?.as_basic_type_enum(),
             Type::Ref { .. } => self.context.ptr_type(AddressSpace::default()).into(),

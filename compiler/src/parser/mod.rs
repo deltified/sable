@@ -977,8 +977,23 @@ fn main() -> i64
     let v: vec<i64> = vec.new()
     let m: map<str, i64> = map.new()
     let om: ordered_map<str, i64> = ordered_map.new()
-    return vec.len(v) + map.len(m) + ordered_map.len(om)
+    return v.len() + m.len() + om.len()
 }
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parse(tokens);
+        assert!(!parse_diags.has_errors());
+        assert_eq!(module.items.len(), 1);
+    }
+
+    #[test]
+    fn parses_ptr_type_in_signature() {
+        let src = r#"
+extern "C" fn passthrough(p: ptr<i64>) -> ptr<i64>
+    effects(none)
 "#;
 
         let (tokens, lex_diags) = lexer::lex(0, src);

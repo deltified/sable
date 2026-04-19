@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use ahash::RandomState;
 use anyhow::{Result, anyhow, bail};
@@ -14,7 +16,7 @@ pub enum RuntimeValue {
     Float(f64),
     Bool(bool),
     Str(String),
-    Vec(Vec<RuntimeValue>),
+    Vec(Rc<RefCell<Vec<RuntimeValue>>>),
     Map(HashMap<RuntimeKey, RuntimeValue, RandomState>),
     OrderedMap(BTreeMap<RuntimeKey, RuntimeValue>),
     Array(Vec<RuntimeValue>),
@@ -301,6 +303,7 @@ fn eval_index_load(base: RuntimeValue, index: RuntimeValue) -> Result<RuntimeVal
             .map(|ch| RuntimeValue::Int(ch as i64))
             .ok_or_else(|| anyhow!("string index {} out of bounds", index)),
         RuntimeValue::Vec(values) => values
+            .borrow()
             .get(index)
             .cloned()
             .ok_or_else(|| anyhow!("vector index {} out of bounds", index)),
@@ -425,7 +428,10 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
             if !args.is_empty() {
                 bail!("{} expects no arguments", callee)
             }
-            Ok((true, Some(RuntimeValue::Vec(Vec::new()))))
+            Ok((
+                true,
+                Some(RuntimeValue::Vec(Rc::new(RefCell::new(Vec::new())))),
+            ))
         }
         "vec.with_capacity" => {
             if args.len() != 1 {
@@ -433,19 +439,24 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
             }
 
             let cap = value_as_index(&args[0])?;
-            Ok((true, Some(RuntimeValue::Vec(Vec::with_capacity(cap)))))
+            Ok((
+                true,
+                Some(RuntimeValue::Vec(Rc::new(RefCell::new(Vec::with_capacity(
+                    cap,
+                ))))),
+            ))
         }
         "vec.push" => {
             if args.len() != 2 {
                 bail!("vec.push expects exactly two arguments")
             }
             let value = args.pop().expect("arg exists");
-            let RuntimeValue::Vec(mut values) = args.pop().expect("arg exists") else {
+            let RuntimeValue::Vec(values) = args.pop().expect("arg exists") else {
                 bail!("vec.push first argument must be vec<T>")
             };
 
-            values.push(value);
-            Ok((true, Some(RuntimeValue::Vec(values))))
+            values.borrow_mut().push(value);
+            Ok((true, None))
         }
         "vec.get" => {
             if args.len() != 2 {
@@ -457,6 +468,7 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
             };
 
             let value = values
+                .borrow()
                 .get(index)
                 .cloned()
                 .ok_or_else(|| anyhow!("vec.get index {} out of bounds", index))?;
@@ -467,25 +479,26 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
                 bail!("vec.remove expects exactly two arguments")
             }
             let index = value_as_index(&args[1])?;
-            let RuntimeValue::Vec(mut values) = args.remove(0) else {
+            let RuntimeValue::Vec(values) = args.remove(0) else {
                 bail!("vec.remove first argument must be vec<T>")
             };
 
+            let mut values = values.borrow_mut();
             if index >= values.len() {
                 bail!("vec.remove index {} out of bounds", index)
             }
             values.remove(index);
-            Ok((true, Some(RuntimeValue::Vec(values))))
+            Ok((true, None))
         }
         "vec.clear" => {
             if args.len() != 1 {
                 bail!("vec.clear expects exactly one argument")
             }
-            let RuntimeValue::Vec(mut values) = args.pop().expect("arg exists") else {
+            let RuntimeValue::Vec(values) = args.pop().expect("arg exists") else {
                 bail!("vec.clear argument must be vec<T>")
             };
-            values.clear();
-            Ok((true, Some(RuntimeValue::Vec(values))))
+            values.borrow_mut().clear();
+            Ok((true, None))
         }
         "vec.is_empty" => {
             if args.len() != 1 {
@@ -494,7 +507,7 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
             let RuntimeValue::Vec(values) = args.pop().expect("arg exists") else {
                 bail!("vec.is_empty argument must be vec<T>")
             };
-            Ok((true, Some(RuntimeValue::Bool(values.is_empty()))))
+            Ok((true, Some(RuntimeValue::Bool(values.borrow().is_empty()))))
         }
         "vec.len" => {
             if args.len() != 1 {
@@ -503,7 +516,7 @@ fn run_builtin(callee: &str, mut args: Vec<RuntimeValue>) -> Result<(bool, Optio
             let RuntimeValue::Vec(values) = args.pop().expect("arg exists") else {
                 bail!("vec.len argument must be vec<T>")
             };
-            Ok((true, Some(RuntimeValue::Int(values.len() as i64))))
+            Ok((true, Some(RuntimeValue::Int(values.borrow().len() as i64))))
         }
         "map.new" => {
             if !args.is_empty() {
@@ -730,6 +743,7 @@ pub fn format_value(value: &RuntimeValue) -> String {
         RuntimeValue::Str(value) => value.clone(),
         RuntimeValue::Vec(values) => {
             let inner = values
+                .borrow()
                 .iter()
                 .map(format_value)
                 .collect::<Vec<_>>()
@@ -796,27 +810,27 @@ fn main() -> i64
     let message = hello + target
     io.out(message)
 
-    let has_word = str.contains(message, "Sable")
+    let has_word = message.contains("Sable")
     if has_word {
-        io.out(str.slice(message, 0, 5))
+        io.out(message.slice(0, 5))
     }
 
     let v: vec<i64> = vec.new()
-    v = vec.push(v, 7)
-    v = vec.push(v, 35)
+    v.push(7)
+    v.push(35)
 
-    let count = vec.len(v)
+    let count = v.len()
     io.out(count)
 
     let m: map<str, i64> = map.new()
-    m = map.put(m, "answer", vec.get(v, 1))
+    m = m.put("answer", v.get(1))
 
     let om: ordered_map<str, i64> = ordered_map.new()
-    om = ordered_map.put(om, "left", 1)
-    om = ordered_map.put(om, "right", 2)
+    om = om.put("left", 1)
+    om = om.put("right", 2)
 
-    let idx = str.find(message, "Sable")
-    let result = map.get(m, "answer") + idx + ordered_map.len(om)
+    let idx = message.find("Sable")
+    let result = m.get("answer") + idx + om.len()
     return result
 }
 "#;
@@ -851,34 +865,34 @@ fn main() -> i32
     }
 
     let values: vec<i32> = vec.new()
-    values = vec.push(values, 10s)
-    values = vec.push(values, 20s)
-    values = vec.push(values, 30s)
+    values.push(10s)
+    values.push(20s)
+    values.push(30s)
     for value in values {
         total += value
     }
 
-    values = vec.remove(values, 1)
-    let values_empty_before = vec.is_empty(values)
-    let values_len = vec.len(values)
-    values = vec.clear(values)
-    let values_empty_after = vec.is_empty(values)
+    values.remove(1)
+    let values_empty_before = values.is_empty()
+    let values_len = values.len()
+    values.clear()
+    let values_empty_after = values.is_empty()
 
     let m: map<str, i32> = map.new()
-    m = map.put(m, "a", 1s)
-    m = map.put(m, "b", 2s)
-    m = map.remove(m, "a")
-    let has_a = map.contains(m, "a")
-    m = map.clear(m)
-    let m_empty = map.is_empty(m)
+    m = m.put("a", 1s)
+    m = m.put("b", 2s)
+    m = m.remove("a")
+    let has_a = m.contains("a")
+    m = m.clear()
+    let m_empty = m.is_empty()
 
     let om: ordered_map<str, i32> = ordered_map.new()
-    om = ordered_map.put(om, "left", 1s)
-    om = ordered_map.put(om, "right", 2s)
-    om = ordered_map.remove(om, "left")
-    let has_left = ordered_map.contains(om, "left")
-    om = ordered_map.clear(om)
-    let om_empty = ordered_map.is_empty(om)
+    om = om.put("left", 1s)
+    om = om.put("right", 2s)
+    om = om.remove("left")
+    let has_left = om.contains("left")
+    om = om.clear()
+    let om_empty = om.is_empty()
 
     if values_empty_before {
         total += 1000s

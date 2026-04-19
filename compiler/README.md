@@ -24,7 +24,7 @@ Implemented baseline features:
   - range operator `..`
 - semantic checks for:
   - symbol resolution in local scopes
-  - baseline type checking (integers, floats, bool, strings, arrays, refs, named types)
+  - baseline type checking (integers, floats, bool, strings, arrays, refs, ptr<T>, named types)
   - call arity and argument type checks
   - effect propagation through calls
   - undeclared effect diagnostics
@@ -35,6 +35,8 @@ Implemented baseline features:
   - `vec.new`, `vec.with_capacity`, `vec.push`, `vec.get`, `vec.remove`, `vec.clear`, `vec.is_empty`, `vec.len`
   - `map.new`, `map.with_capacity`, `map.put`, `map.get`, `map.contains`, `map.remove`, `map.clear`, `map.is_empty`, `map.len`
   - `ordered_map.new`, `ordered_map.put`, `ordered_map.get`, `ordered_map.contains`, `ordered_map.remove`, `ordered_map.clear`, `ordered_map.is_empty`, `ordered_map.len`
+  - receiver-style method syntax for non-constructor collection/string operations (constructors stay namespace-style)
+  - vec mutators (`push`, `remove`, `clear`) are statement-style operations that mutate the receiver and return `void`
 - typed MIR pipeline:
   - CFG-based MIR with explicit blocks and terminators
   - typed MIR instructions for copies, unary/binary ops, calls, and control-flow lowering

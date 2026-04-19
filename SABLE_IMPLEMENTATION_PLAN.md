@@ -20,8 +20,11 @@
 - C1-WP16 (ordered_map baseline): implemented in bootstrap form with `ordered_map<K,V>` syntax and runtime builtins (`new`, `put`, `get`, `contains`, `len`).
 - C1-WP17 (hash map baseline): implemented in bootstrap form with `map<K,V>` syntax and runtime builtins (`new`, `with_capacity`, `put`, `get`, `contains`, `len`) backed by fast hashing.
 - C1 collection API expansion (bootstrap): added `remove`, `clear`, and `is_empty` across `vec<T>`, `map<K,V>`, and `ordered_map<K,V>` in sema, MIR, runtime, and LLVM IR lowering.
+- C1 call syntax alignment (bootstrap): non-constructor string/collection operations now use receiver-style method calls; constructors remain namespace-style (`vec.new`, `map.new`, `ordered_map.new`).
+- C1 vec mutation semantics refinement (bootstrap): `vec.push`, `vec.remove`, and `vec.clear` are now statement-style receiver mutations (no reassignment pattern) with void return semantics.
 - C1 for-loop coverage expansion (bootstrap): `for` lowering now supports fixed arrays, ranges, `vec<T>`, and `str` with canonical index-based MIR form.
 - C1 inference refinement (bootstrap): constructor-based local generic inference now propagates through plain assignments (`=`) for collection locals.
+- C1 pointer typing baseline (bootstrap): `ptr<T>` now lowers and type-checks through parser/sema/MIR/LLVM type mapping for signatures and local typing groundwork.
 - C1-WP21 and C1-WP22: implemented as typed CFG MIR with canonical lowering and baseline optimization passes.
 - LLVM backend status: working on Windows for supported subset behind `llvm-backend`, including `IndexLoad`/`MemberLoad` plus runtime-backed string/collection builtin call lowering.
 - New bootstrap execution path: MIR interpreter (`run` command) supports end-to-end execution for current subset.
