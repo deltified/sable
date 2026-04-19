@@ -1,0 +1,23 @@
+fn main() -> i64
+    effects(io, alloc)
+{
+    let first = "Hello"
+    let second = "Sable"
+    let with_space = str.concat(first, ", ")
+    let message = with_space + second
+    io.out(message)
+
+    let numbers = vec.new_i64()
+    numbers = vec.push(numbers, 4)
+    numbers = vec.push(numbers, 6)
+
+    let first_num = vec.get(numbers, 0)
+    let second_num = vec.get(numbers, 1)
+    let total = first_num + second_num
+
+    let size = vec.len(numbers)
+    io.out(size)
+    io.out(total)
+
+    return total
+}

@@ -7,6 +7,7 @@ mod driver;
 mod lexer;
 mod mir;
 mod parser;
+mod runtime;
 mod sema;
 mod source;
 

@@ -994,16 +994,17 @@ impl<'a> MirLowerer<'a> {
                     _ => return Err(anyhow!("unsupported call target in MIR lowering")),
                 };
 
-                let mut effects = BTreeSet::new();
-                let return_ty = if callee_name == "io.out" {
-                    effects.insert("io".to_string());
-                    Type::Void
+                        let (return_ty, effects) = if let Some((builtin_ty, builtin_effects)) =
+                            self.resolve_builtin_call(&callee_name, &lowered_args)?
+                        {
+                            (builtin_ty, builtin_effects)
                 } else {
                     let Some(sig) = self.checked.functions.get(&callee_name) else {
                         return Err(anyhow!("unknown function '{}'", callee_name));
                     };
+                            let mut effects = BTreeSet::new();
                     effects.extend(sig.declared_effects.effects.iter().cloned());
-                    sig.return_type.clone()
+                            (sig.return_type.clone(), effects)
                 };
 
                 let args = lowered_args
@@ -1075,6 +1076,7 @@ impl<'a> MirLowerer<'a> {
                 let elem_ty = match &base.ty {
                     Type::Array { inner, .. } => inner.as_ref().clone(),
                     Type::Str => Type::I32,
+                    Type::Vec(inner) => inner.as_ref().clone(),
                     other => {
                         return Err(anyhow!(
                             "index expression is not supported for type {:?}",
@@ -1127,6 +1129,69 @@ impl<'a> MirLowerer<'a> {
             field,
             base_ty
         ))
+    }
+
+    fn resolve_builtin_call(
+        &self,
+        callee: &str,
+        args: &[TypedOperand],
+    ) -> Result<Option<(Type, BTreeSet<String>)>> {
+        let mut effects = BTreeSet::new();
+
+        let resolved = match callee {
+            "io.out" => {
+                if args.len() != 1 {
+                    bail!("io.out expects exactly one argument");
+                }
+                effects.insert("io".to_string());
+                Some(Type::Void)
+            }
+            "str.concat" => {
+                if args.len() != 2 || args[0].ty != Type::Str || args[1].ty != Type::Str {
+                    bail!("str.concat expects two str arguments");
+                }
+                effects.insert("alloc".to_string());
+                Some(Type::Str)
+            }
+            "str.len" => {
+                if args.len() != 1 || args[0].ty != Type::Str {
+                    bail!("str.len expects one str argument");
+                }
+                Some(Type::I64)
+            }
+            "vec.new_i64" => {
+                if !args.is_empty() {
+                    bail!("vec.new_i64 expects no arguments");
+                }
+                effects.insert("alloc".to_string());
+                Some(Type::Vec(Box::new(Type::I64)))
+            }
+            "vec.push" => {
+                if args.len() != 2 || !is_vec_i64_type(&args[0].ty) || args[1].ty != Type::I64 {
+                    bail!("vec.push expects (vec_i64, i64)");
+                }
+                effects.insert("alloc".to_string());
+                Some(Type::Vec(Box::new(Type::I64)))
+            }
+            "vec.get" => {
+                if args.len() != 2
+                    || !is_vec_i64_type(&args[0].ty)
+                    || !is_integral_type(&args[1].ty)
+                {
+                    bail!("vec.get expects (vec_i64, integral index)");
+                }
+                Some(Type::I64)
+            }
+            "vec.len" => {
+                if args.len() != 1 || !is_vec_i64_type(&args[0].ty) {
+                    bail!("vec.len expects one vec_i64 argument");
+                }
+                Some(Type::I64)
+            }
+            _ => None,
+        };
+
+        Ok(resolved.map(|ty| (ty, effects)))
     }
 
     fn expect_scalar(&self, value: LoweredValue) -> Result<TypedOperand> {
@@ -1259,8 +1324,17 @@ fn lower_named_type(name: &str) -> Type {
         "f64" => Type::F64,
         "f32" => Type::F32,
         "str" => Type::Str,
+        "vec_i64" => Type::Vec(Box::new(Type::I64)),
         _ => Type::Named(name.to_string()),
     }
+}
+
+fn is_integral_type(ty: &Type) -> bool {
+    matches!(ty, Type::I64 | Type::I32 | Type::I8 | Type::U64 | Type::U32)
+}
+
+fn is_vec_i64_type(ty: &Type) -> bool {
+    matches!(ty, Type::Vec(inner) if inner.as_ref() == &Type::I64)
 }
 
 fn infer_int_type(value: &str) -> Type {
@@ -1311,6 +1385,7 @@ fn parse_float_literal(text: &str) -> Result<f64> {
 fn default_value_for_type(ty: &Type) -> MirOperand {
     match ty {
         Type::Bool => MirOperand::Const(MirConst::Bool(false)),
+        Type::Str => MirOperand::Const(MirConst::Str(String::new())),
         Type::F64 => MirOperand::Const(MirConst::Float(0.0, Type::F64)),
         Type::F32 => MirOperand::Const(MirConst::Float(0.0, Type::F32)),
         Type::I64 => MirOperand::Const(MirConst::Int(0, Type::I64)),
@@ -1408,6 +1483,14 @@ fn fold_binary_constant(op: BinaryOp, lhs: &MirOperand, rhs: &MirOperand) -> Opt
             match op {
                 BinaryOp::And => Some(MirConst::Bool(*l && *r)),
                 BinaryOp::Or => Some(MirConst::Bool(*l || *r)),
+                BinaryOp::Eq => Some(MirConst::Bool(l == r)),
+                BinaryOp::Ne => Some(MirConst::Bool(l != r)),
+                _ => None,
+            }
+        }
+        (MirOperand::Const(MirConst::Str(l)), MirOperand::Const(MirConst::Str(r))) => {
+            match op {
+                BinaryOp::Add => Some(MirConst::Str(format!("{l}{r}"))),
                 BinaryOp::Eq => Some(MirConst::Bool(l == r)),
                 BinaryOp::Ne => Some(MirConst::Bool(l != r)),
                 _ => None,

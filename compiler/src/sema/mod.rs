@@ -16,6 +16,7 @@ pub enum Type {
     F64,
     F32,
     Str,
+    Vec(Box<Type>),
     Named(String),
     Ref {
         region: Option<String>,
@@ -641,10 +642,11 @@ impl<'a> FunctionChecker<'a> {
                 match base_ty {
                     Type::Array { inner, .. } => *inner,
                     Type::Str => Type::I32,
+                    Type::Vec(inner) => *inner,
                     _ => {
                         self.diagnostics.error(
                             "SEM027",
-                            "indexing is only supported on arrays and strings",
+                            "indexing is only supported on arrays, vectors, and strings",
                             Some(expr.span),
                         );
                         Type::Unknown
@@ -710,9 +712,10 @@ impl<'a> FunctionChecker<'a> {
             }
             ExprKind::Member { base, field } => {
                 if let ExprKind::Name(module_name) = &base.kind {
-                    if module_name == "io" && field == "out" {
-                        self.used_effects.add_effect("io");
-                        return Type::Void;
+                    if let Some(ty) =
+                        self.check_builtin_member_call(module_name, field, &arg_types, span)
+                    {
+                        return ty;
                     }
                 }
 
@@ -731,6 +734,162 @@ impl<'a> FunctionChecker<'a> {
         }
     }
 
+    fn check_builtin_member_call(
+        &mut self,
+        module_name: &str,
+        field: &str,
+        arg_types: &[Type],
+        span: Span,
+    ) -> Option<Type> {
+        let vec_i64 = Type::Vec(Box::new(Type::I64));
+
+        match (module_name, field) {
+            ("io", "out") => {
+                if arg_types.len() != 1 {
+                    self.diagnostics.error(
+                        "SEM035",
+                        "io.out expects exactly one argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] == Type::Void {
+                    self.diagnostics.error(
+                        "SEM035",
+                        "io.out argument cannot be void",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                self.used_effects.add_effect("io");
+                Some(Type::Void)
+            }
+            ("str", "concat") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM036",
+                        "str.concat expects exactly two string arguments",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] != Type::Str || arg_types[1] != Type::Str {
+                    self.diagnostics.error(
+                        "SEM036",
+                        "str.concat arguments must both be of type str",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                self.used_effects.add_effect("alloc");
+                Some(Type::Str)
+            }
+            ("str", "len") => {
+                if arg_types.len() != 1 {
+                    self.diagnostics.error(
+                        "SEM037",
+                        "str.len expects exactly one argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] != Type::Str {
+                    self.diagnostics.error(
+                        "SEM037",
+                        "str.len argument must be of type str",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::I64)
+            }
+            ("vec", "new_i64") => {
+                if !arg_types.is_empty() {
+                    self.diagnostics.error(
+                        "SEM038",
+                        "vec.new_i64 expects no arguments",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                self.used_effects.add_effect("alloc");
+                Some(vec_i64)
+            }
+            ("vec", "push") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM039",
+                        "vec.push expects arguments (vec_i64, i64)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] != vec_i64 || arg_types[1] != Type::I64 {
+                    self.diagnostics.error(
+                        "SEM039",
+                        "vec.push expects arguments (vec_i64, i64)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                self.used_effects.add_effect("alloc");
+                Some(vec_i64)
+            }
+            ("vec", "get") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM055",
+                        "vec.get expects arguments (vec_i64, index)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] != vec_i64 || !arg_types[1].is_integral() {
+                    self.diagnostics.error(
+                        "SEM055",
+                        "vec.get expects arguments (vec_i64, integral index)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::I64)
+            }
+            ("vec", "len") => {
+                if arg_types.len() != 1 {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.len expects exactly one vec_i64 argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] != vec_i64 {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.len expects exactly one vec_i64 argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::I64)
+            }
+            _ => None,
+        }
+    }
+
     fn check_binary(&mut self, op: BinaryOp, lhs: &Type, rhs: &Type, span: Span) -> Type {
         match op {
             BinaryOp::Range => {
@@ -745,7 +904,21 @@ impl<'a> FunctionChecker<'a> {
                     Type::Unknown
                 }
             }
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+            BinaryOp::Add => {
+                if lhs == &Type::Str && rhs == &Type::Str {
+                    Type::Str
+                } else if lhs.is_numeric() && rhs.is_numeric() && lhs == rhs {
+                    lhs.clone()
+                } else {
+                    self.diagnostics.error(
+                        "SEM041",
+                        "'+' operands must be identical numeric types or both str",
+                        Some(span),
+                    );
+                    Type::Unknown
+                }
+            }
+            BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                 if lhs.is_numeric() && rhs.is_numeric() && lhs == rhs {
                     lhs.clone()
                 } else {
@@ -893,6 +1066,7 @@ fn lower_named_type(name: &str) -> Type {
         "f64" => Type::F64,
         "f32" => Type::F32,
         "str" => Type::Str,
+        "vec_i64" => Type::Vec(Box::new(Type::I64)),
         _ => Type::Named(name.to_string()),
     }
 }

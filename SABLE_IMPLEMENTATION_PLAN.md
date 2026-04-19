@@ -12,6 +12,19 @@
 - Every work package includes implementation mechanics and guarantee alignment
 - Every phase includes test strategy and acceptance gates
 
+## Bootstrap Progress Snapshot (2026-04-19)
+- C1-WP01 through C1-WP14: mostly implemented in bootstrap compiler form (lexer/parser/name+type+effect checks/MIR/CLI).
+- C1-WP11 (structs): implemented with deterministic field ordering metadata propagated through MIR and LLVM lowering.
+- C1-WP12 (control flow): implemented for if/while/for/break/continue with loop-context diagnostics and CFG lowering.
+- C1-WP15 (vector baseline): partially implemented as `vec_i64` runtime/builtin path (`new_i64`, `push`, `get`, `len`) with MIR execution support.
+- C1-WP21 and C1-WP22: implemented as typed CFG MIR with canonical lowering and baseline optimization passes.
+- LLVM backend status: working on Windows for supported subset behind `llvm-backend`, including `IndexLoad` and `MemberLoad`.
+- New bootstrap execution path: MIR interpreter (`run` command) supports end-to-end execution for current subset.
+- Immediate focus for next milestone:
+	- generalize `vec_i64` to generic vectors,
+	- broaden string operations beyond concat/len,
+	- improve LLVM parity for runtime-backed features.
+
 ## Global Program Architecture
 - Compiler executable is split into frontend, middle-end, backend, and tooling layers
 - Runtime library is split into memory runtime, task runtime, deterministic runtime, and hot reload runtime

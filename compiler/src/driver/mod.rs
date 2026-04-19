@@ -7,6 +7,7 @@ use crate::diagnostics::Diagnostics;
 use crate::lexer;
 use crate::mir;
 use crate::parser;
+use crate::runtime;
 use crate::sema;
 use crate::source::SourceDb;
 
@@ -83,6 +84,23 @@ pub fn run() -> Result<()> {
             println!("{ir}");
             Ok(())
         }
+        "run" => {
+            let (checked, sema_diags) = sema::check(&module);
+            diagnostics.extend(sema_diags);
+            diagnostics.sort_deterministically();
+            emit_and_fail_if_errors(diagnostics, &source_db)?;
+
+            let mut mir_program = mir::lower(&module, &checked)?;
+            mir::optimize(&mut mir_program);
+
+            let result = runtime::run_main(&mir_program)?;
+            if let Some(value) = result {
+                println!("program returned: {}", runtime::format_value(&value));
+            } else {
+                println!("program returned: void");
+            }
+            Ok(())
+        }
         _ => {
             print_usage();
             bail!("unknown command: {}", command)
@@ -105,5 +123,5 @@ fn emit_and_fail_if_errors(mut diagnostics: Diagnostics, source_db: &SourceDb) -
 }
 
 fn print_usage() {
-    eprintln!("usage: compiler <tokens|ast|check|mir|ir> <input.sable>");
+    eprintln!("usage: compiler <tokens|ast|check|mir|ir|run> <input.sable>");
 }

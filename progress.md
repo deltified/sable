@@ -5,137 +5,103 @@ Repository: sable
 
 ## Current Status
 
-The compiler now builds and runs on Windows 11 without requiring a local LLVM installation for frontend and MIR workflows.
+The compiler now supports two validated end-to-end flows on Windows 11:
 
-LLVM-backed IR codegen is now also operational on Windows when the LLVM path is set.
+1. Frontend/Sema/MIR + direct execution through a MIR runtime interpreter (`run` command).
+2. LLVM IR emission (`ir` command) behind `llvm-backend` with LLVM at `C:\Program Files\LLVM`.
 
-Verified working commands:
-- `cargo build`
+Verified commands:
 - `cargo test`
-- `cargo run -- check examples/basics.sable`
-- `cargo run -- mir examples/basics.sable`
-- `$env:LLVM_SYS_221_PREFIX = "C:\Program Files\LLVM"; cargo run --features llvm-backend -- ir examples/basics.sable`
-- `$env:LLVM_SYS_221_PREFIX = "C:\Program Files\LLVM"; cargo run --features llvm-backend -- ir examples/array_for.sable`
+- `cargo run -- run examples/run_showcase.sable`
+- `$env:LLVM_SYS_221_PREFIX = "C:\Program Files\LLVM"; cargo check --features llvm-backend`
 - `$env:LLVM_SYS_221_PREFIX = "C:\Program Files\LLVM"; cargo run --features llvm-backend -- ir examples/struct_param_member.sable`
 
-LLVM IR emission is available behind an opt-in Cargo feature:
-- `cargo run --features llvm-backend -- ir <file.sable>`
-
-Without the feature, the `ir` command fails with a clear actionable message.
+Observed `run` output for `examples/run_showcase.sable`:
+- `Hello, Sable`
+- `2`
+- `10`
+- `program returned: 10`
 
 ## Implemented So Far
 
 ### 1. Compiler Infrastructure
 - Deterministic source loading with stable file IDs.
 - Span tracking across lexer/parser/sema/MIR for diagnostics.
-- Structured diagnostics framework with stable sort order.
+- Structured diagnostics with deterministic sort order.
 
-### 2. Lexer
-- Tokenization for keywords, punctuation, operators, attributes, and effects syntax.
-- Numeric and string literal lexing.
-- Comment and whitespace handling.
-- Lex-time error reporting (invalid chars, unterminated strings).
+### 2. Frontend (Lexer + Parser)
+- Tokenization and parsing for core language forms: structs, functions, attributes, effects, control flow, member/index access, calls, ranges, and typed declarations.
+- String and numeric literal support.
 
-### 3. Parser
-- Top-level items: imports, structs, functions (including extern signatures).
-- Attributes: `@name(...)` and key/value-style arguments.
-- Effects clauses: `effects(...)` and `raise(...)` parsing.
-- Statements: `let`, `return`, `raise`, `if/else`, `while`, `for`, `break`, `continue`, expression statements, nested blocks.
-- Expressions: unary/binary ops, assignment and compound assignment, postfix increment, calls, member access, indexing, range operator `..`.
-- Type syntax: named types, refs (`&T`, `ref T`, `ref<region> T`), arrays (`[T; N]`, `[T]`).
-
-### 4. Semantic Analysis (Sema)
-- Top-level symbol collection for structs/functions.
-- Duplicate declaration diagnostics (structs, fields, functions, locals).
-- Baseline type checking for numeric, bool, string, arrays, refs, named types.
-- Call checking: arity/type matching and unknown callee diagnostics.
-- Effect propagation and undeclared effect diagnostics.
-- Deterministic restriction checks for `@deterministic` (`io`/`unsafe` disallowed).
-- Member/index typing checks.
-- Assignment target validation.
-
-Newly added in this iteration:
+### 3. Semantic Analysis (Sema)
+- Symbol/type/effect checks for baseline language.
 - Loop-context diagnostics:
-  - `SEM016`: `break` outside a loop.
-  - `SEM017`: `continue` outside a loop.
-- `for` iterable tightening for current backend compatibility:
-  - supports ranges and fixed-size arrays.
-  - explicit diagnostics for unsized arrays and strings in `for` until lowering/runtime support is added.
-- Struct metadata now preserves deterministic field order and field-index maps for downstream MIR/codegen lowering.
+  - `SEM016`: `break` outside loop.
+  - `SEM017`: `continue` outside loop.
+- Struct field-order/index metadata for deterministic downstream lowering.
+- Builtin member-call typing and effects for:
+  - `io.out`
+  - `str.concat`, `str.len`
+  - `vec.new_i64`, `vec.push`, `vec.get`, `vec.len`
+- String `+` typing support.
+- Vector indexing typing support (`vec_i64[index]`).
 
-### 5. MIR Lowering + Optimization
-- Typed CFG-based MIR with explicit blocks and terminators.
-- Lowering for control flow (`if/while/for`), expressions, calls, assignments, and loop control.
-- Constant folding pass and dead-branch/dead-block elimination.
+### 4. MIR Lowering and Optimization
+- CFG-based typed MIR lowering for expressions/control flow.
+- `for` lowering over fixed-size arrays via index loops (`IndexLoad`).
+- Struct metadata (`MirStruct`) propagated into MIR program.
+- Builtin call resolution expanded for `io`, `str`, and `vec` runtime intrinsics.
+- String constant folding for `+`, `==`, `!=`.
+- Default local init for `str` now emits empty string constant.
 
-Newly added in this iteration:
-- MIR lowering for `for` over fixed-size arrays.
-- Array iteration lowers via index-based loop and emits `IndexLoad` per iteration.
-- Refactor of for-loop lowering into reusable internal helpers.
-- MIR program now carries struct metadata (`MirStruct`) so backend lowering has deterministic field indices.
+### 5. Runtime Execution Path
+- New MIR runtime interpreter module.
+- New CLI command: `run <file.sable>`.
+- Runtime builtins implemented:
+  - `io.out`
+  - `str.concat`, `str.len`
+  - `vec.new_i64`, `vec.push`, `vec.get`, `vec.len`
+- Runtime unit test added and passing.
 
-### 6. LLVM Codegen
-- Existing Inkwell-based backend retained.
-- Now feature-gated as `llvm-backend` so platform setup is optional for frontend/MIR work.
-- Clear runtime error if `ir` is requested without LLVM backend enabled.
-- Windows `llvm-config` absence is handled by backend configuration changes plus explicit linking against `LLVM-C` from `LLVM_SYS_221_PREFIX`.
-- Implemented `IndexLoad` lowering to LLVM GEP+load for fixed-size array iteration.
-- Implemented `MemberLoad` lowering to LLVM struct-field GEP+load.
-- Added named-struct type declaration/definition lowering from MIR metadata to LLVM named struct types.
+### 6. LLVM Codegen (Windows)
+- Backend remains optional behind `llvm-backend`.
+- Windows path without `llvm-config` is supported via explicit configuration and linking.
+- `IndexLoad` and `MemberLoad` lowering implemented.
+- MIR struct metadata now drives named struct type lowering in LLVM backend.
+- Verified IR generation on Windows with LLVM prefix configured.
 
-### 7. CLI
-- Commands supported: `tokens`, `ast`, `check`, `mir`, `ir`.
-- `ir` command behavior is now explicit about feature requirements.
+### 7. CLI and Examples
+- Commands now supported: `tokens`, `ast`, `check`, `mir`, `run`, `ir`.
+- Added end-to-end execution example: `examples/run_showcase.sable`.
+- Existing backend validation examples retained:
+  - `examples/array_for.sable`
+  - `examples/struct_param_member.sable`
 
 ### 8. Tests
-- Existing parser/sema/MIR tests preserved.
-- Added sema regression test for invalid `break`/`continue` usage.
-- Added MIR regression test proving fixed-size array `for` loops emit `IndexLoad`.
-- Test suite currently passes (5/5).
-- Added backend validation examples for array indexing and struct member access (`examples/array_for.sable`, `examples/struct_param_member.sable`) and confirmed IR emission on Windows.
+- All current unit tests pass (6/6), including runtime strings/vectors test.
 
-## What Is Still Missing (Major)
+## Remaining Gaps (Major)
 
-- Full LLVM codegen coverage for:
-  - string constants / string runtime representation
-  - index/member store paths (writes through aggregate lvalues)
-  - reference-based aggregate access (member/index through refs)
-- Struct type lowering and field layout integration in backend.
-- Borrow checker and region checker over CFG.
-- Determinism checker depth beyond current effect-level constraints.
-- `try/catch` semantics and lowering.
-- Richer effect metadata usage in MIR optimization/codegen.
-- Runtime layer (alloc/task/replay/hot-reload) beyond bootstrap scope.
+- Collections are still narrow: only `vec_i64` exists (no generic `vec<T>` yet).
+- String library is still minimal (`concat`, `len`, `+` typing/folding only).
+- LLVM backend does not yet lower full runtime-backed string/vector semantics.
+- Aggregate store/reference-heavy codegen paths still partial.
+- Borrow checker, region checker, and full determinism checker are not yet implemented.
+- `try/catch` is still not lowered end-to-end.
 
-## Logical Next Steps (Priority Order)
+## Logical Next Steps
 
-1. Complete backend parity for existing MIR:
-- implement index/member store lowering and ref-based aggregate access in LLVM codegen.
-- implement string constants and baseline string runtime interop in LLVM codegen.
-- add IR golden tests for member/index-heavy programs.
+1. Generalize vectors from `vec_i64` to `vec<T>` in type system + sema + MIR + runtime.
+2. Expand string API (slice/substr, contains/find, comparisons, conversions) with effect/type rules and tests.
+3. Implement integration tests for CLI `run` command using example programs.
+4. Continue LLVM parity by lowering runtime-compatible string/vector operations to IR (or explicit runtime calls).
+5. Complete aggregate stores and ref-based aggregate access in backend.
 
-2. Finish iterable parity across sema/MIR/codegen:
-- either implement string iteration (`for x in str`) end-to-end or intentionally gate it everywhere with consistent diagnostics.
-- support unsized-array iteration where semantics are defined.
+## Near-Term Milestone
 
-3. Strengthen type-system guarantees:
-- validate unresolved named types in declarations and local annotations.
-- improve assignability/coercion rules and diagnostics quality.
-
-4. Expand language surface already tokenized but partial:
-- implement `try/catch` in AST/sema/MIR.
-- add focused tests for error-flow and effect interactions (`raise(...)`).
-
-5. Grow test coverage and CI quality gates:
-- add integration tests for CLI commands (`check`, `mir`, feature-gated `ir`).
-- add negative tests for unsupported forms to lock behavior.
-- add deterministic ordering snapshots for diagnostics and MIR output.
-
-## Suggested Near-Term Milestone
-
-Milestone M1: "Backend parity for current MIR"
-- Goal: any program accepted by `check` and `mir` in the baseline numeric/array/struct subset should also emit LLVM IR when built with `--features llvm-backend`.
+Milestone M2: "Runnable baseline language"
+- Goal: core programs with control flow, structs, strings, and vectors compile through sema/MIR and execute via `run` with deterministic behavior.
 - Exit criteria:
-  - no `not implemented` backend errors for `MemberLoad`, `IndexLoad`, string constants in supported subset.
-  - passing unit/integration tests for the new backend paths.
-  - updated docs and examples demonstrating full path: source -> sema -> MIR -> LLVM IR.
+  - stable `run` outputs for representative examples,
+  - integration tests for `run`,
+  - documented limits for features not yet codegen-backed in LLVM path.

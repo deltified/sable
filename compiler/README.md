@@ -5,6 +5,7 @@ This is an initial compiler implementation aligned to the Sable v2.0 direction:
 - explicit effect declarations in signatures
 - semantic checking for core language constructs
 - typed MIR between sema and backend
+- MIR interpreter execution path via `run`
 - optional LLVM IR emission through Inkwell (`llvm-backend` feature)
 
 ## Current Scope
@@ -28,10 +29,14 @@ Implemented baseline features:
   - effect propagation through calls
   - undeclared effect diagnostics
   - deterministic-function restrictions (`@deterministic` blocks `io` and `unsafe` use)
+- builtin type/effect checking for `io.out`, `str.concat`, `str.len`, `vec.new_i64`, `vec.push`, `vec.get`, `vec.len`
 - typed MIR pipeline:
   - CFG-based MIR with explicit blocks and terminators
   - typed MIR instructions for copies, unary/binary ops, calls, and control-flow lowering
   - deterministic pass pipeline (`constant_fold` -> dead-branch/dead-block elimination)
+- runtime execution pipeline:
+  - MIR interpreter for a bootstrap execution path (`cargo run -- run <file.sable>`)
+  - current runtime builtins for strings and `vec_i64`
 - LLVM IR codegen (Inkwell) for baseline numeric/control-flow subset when `llvm-backend` is enabled
 - LLVM IR lowering for array index loads and struct member loads in the current subset
 
@@ -52,6 +57,7 @@ Default build (frontend + sema + MIR) does not require a local LLVM install.
 ```bash
 cargo check
 cargo test
+cargo run -- run examples/run_showcase.sable
 ```
 
 Enable LLVM IR backend explicitly when needed:
@@ -96,6 +102,7 @@ cargo run -- tokens <file.sable>
 cargo run -- ast <file.sable>
 cargo run -- check <file.sable>
 cargo run -- mir <file.sable>
+cargo run -- run <file.sable>
 cargo run -- ir <file.sable>
 ```
 
@@ -107,6 +114,7 @@ A core-feature example is provided at:
 - examples/basics.sable
 - examples/array_for.sable
 - examples/struct_param_member.sable
+- examples/run_showcase.sable
 
 Generate IR:
 
