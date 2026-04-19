@@ -97,6 +97,10 @@ impl EffectSyntax {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeSyntax {
     Named(String),
+    Generic {
+        name: String,
+        args: Vec<TypeSyntax>,
+    },
     Ref {
         region: Option<String>,
         mutable: bool,

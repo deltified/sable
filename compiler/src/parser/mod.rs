@@ -388,7 +388,25 @@ impl Parser {
         }
 
         if self.at(TokenKind::Identifier) {
-            return Some(TypeSyntax::Named(self.bump().text));
+            let name = self.bump().text;
+            if self.at(TokenKind::Lt) {
+                self.bump();
+
+                let mut args = Vec::new();
+                while !self.at(TokenKind::Gt) && !self.at(TokenKind::Eof) {
+                    args.push(self.parse_type()?);
+                    if self.at(TokenKind::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+
+                self.expect(TokenKind::Gt, "expected '>' after generic type arguments")?;
+                return Some(TypeSyntax::Generic { name, args });
+            }
+
+            return Some(TypeSyntax::Named(name));
         }
 
         self.diagnostics.error(
@@ -945,6 +963,27 @@ fn sum(n: i64) -> i64
 
         let (tokens, lex_diags) = lexer::lex(0, src);
         assert!(!lex_diags.has_errors());
+        let (module, parse_diags) = parse(tokens);
+        assert!(!parse_diags.has_errors());
+        assert_eq!(module.items.len(), 1);
+    }
+
+    #[test]
+    fn parses_generic_collection_types() {
+        let src = r#"
+fn main() -> i64
+    effects(alloc)
+{
+    let v: vec<i64> = vec.new()
+    let m: map<str, i64> = map.new()
+    let om: ordered_map<str, i64> = ordered_map.new()
+    return vec.len(v) + map.len(m) + ordered_map.len(om)
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
         let (module, parse_diags) = parse(tokens);
         assert!(!parse_diags.has_errors());
         assert_eq!(module.items.len(), 1);

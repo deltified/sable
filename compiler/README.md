@@ -29,14 +29,19 @@ Implemented baseline features:
   - effect propagation through calls
   - undeclared effect diagnostics
   - deterministic-function restrictions (`@deterministic` blocks `io` and `unsafe` use)
-- builtin type/effect checking for `io.out`, `str.concat`, `str.len`, `vec.new_i64`, `vec.push`, `vec.get`, `vec.len`
+- builtin type/effect checking for:
+  - `io.out`
+  - `str.concat`, `str.len`, `str.contains`, `str.starts_with`, `str.ends_with`, `str.find`, `str.slice`
+  - `vec.new`, `vec.with_capacity`, `vec.push`, `vec.get`, `vec.len`
+  - `map.new`, `map.with_capacity`, `map.put`, `map.get`, `map.contains`, `map.len`
+  - `ordered_map.new`, `ordered_map.put`, `ordered_map.get`, `ordered_map.contains`, `ordered_map.len`
 - typed MIR pipeline:
   - CFG-based MIR with explicit blocks and terminators
   - typed MIR instructions for copies, unary/binary ops, calls, and control-flow lowering
   - deterministic pass pipeline (`constant_fold` -> dead-branch/dead-block elimination)
 - runtime execution pipeline:
   - MIR interpreter for a bootstrap execution path (`cargo run -- run <file.sable>`)
-  - current runtime builtins for strings and `vec_i64`
+  - current runtime builtins for strings, `vec<T>`, `map<K,V>`, and `ordered_map<K,V>`
 - LLVM IR codegen (Inkwell) for baseline numeric/control-flow subset when `llvm-backend` is enabled
 - LLVM IR lowering for array index loads and struct member loads in the current subset
 
@@ -49,6 +54,11 @@ Advanced Sable features are intentionally partial in this first slice, including
 - hot reload contracts
 - full layout/cache/abi attribute semantics
 - full MIR-level effect metadata and richer optimization passes
+
+Notes on collection semantics:
+- `map<K, V>` uses hash-based lookup for high-performance average-case access.
+- `ordered_map<K, V>` uses ordered keys and stable iteration semantics; deterministic mode can target this without redesign.
+- Key types for map builtins are currently limited to `bool`, integer types, and `str`.
 
 ## Build
 

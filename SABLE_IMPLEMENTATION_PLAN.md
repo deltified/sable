@@ -16,13 +16,16 @@
 - C1-WP01 through C1-WP14: mostly implemented in bootstrap compiler form (lexer/parser/name+type+effect checks/MIR/CLI).
 - C1-WP11 (structs): implemented with deterministic field ordering metadata propagated through MIR and LLVM lowering.
 - C1-WP12 (control flow): implemented for if/while/for/break/continue with loop-context diagnostics and CFG lowering.
-- C1-WP15 (vector baseline): partially implemented as `vec_i64` runtime/builtin path (`new_i64`, `push`, `get`, `len`) with MIR execution support.
+- C1-WP15 (vector baseline): implemented in bootstrap form with generic `vec<T>` type syntax and runtime builtins (`new`, `with_capacity`, `push`, `get`, `len`).
+- C1-WP16 (ordered_map baseline): implemented in bootstrap form with `ordered_map<K,V>` syntax and runtime builtins (`new`, `put`, `get`, `contains`, `len`).
+- C1-WP17 (hash map baseline): implemented in bootstrap form with `map<K,V>` syntax and runtime builtins (`new`, `with_capacity`, `put`, `get`, `contains`, `len`) backed by fast hashing.
 - C1-WP21 and C1-WP22: implemented as typed CFG MIR with canonical lowering and baseline optimization passes.
 - LLVM backend status: working on Windows for supported subset behind `llvm-backend`, including `IndexLoad` and `MemberLoad`.
 - New bootstrap execution path: MIR interpreter (`run` command) supports end-to-end execution for current subset.
+- Deterministic-ready guardrail added for maps: `map<K,V>` is rejected in `@deterministic` functions in favor of `ordered_map<K,V>`.
 - Immediate focus for next milestone:
-	- generalize `vec_i64` to generic vectors,
-	- broaden string operations beyond concat/len,
+	- deepen generic inference for collection constructors,
+	- broaden runtime and optimizer coverage for new stdlib operations,
 	- improve LLVM parity for runtime-backed features.
 
 ## Global Program Architecture

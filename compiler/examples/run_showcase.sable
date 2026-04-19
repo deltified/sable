@@ -6,8 +6,10 @@ fn main() -> i64
     let with_space = str.concat(first, ", ")
     let message = with_space + second
     io.out(message)
+    io.out(str.contains(message, "Sable"))
+    io.out(str.slice(message, 0, 5))
 
-    let numbers = vec.new_i64()
+    let numbers: vec<i64> = vec.new()
     numbers = vec.push(numbers, 4)
     numbers = vec.push(numbers, 6)
 
@@ -15,9 +17,17 @@ fn main() -> i64
     let second_num = vec.get(numbers, 1)
     let total = first_num + second_num
 
+    let fast: map<str, i64> = map.with_capacity(8)
+    fast = map.put(fast, "total", total)
+
+    let stable: ordered_map<str, i64> = ordered_map.new()
+    stable = ordered_map.put(stable, "left", 1)
+    stable = ordered_map.put(stable, "right", 2)
+
     let size = vec.len(numbers)
     io.out(size)
-    io.out(total)
+    io.out(map.get(fast, "total"))
+    io.out(ordered_map.len(stable))
 
-    return total
+    return map.get(fast, "total") + ordered_map.len(stable)
 }

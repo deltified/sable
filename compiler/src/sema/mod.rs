@@ -17,6 +17,8 @@ pub enum Type {
     F32,
     Str,
     Vec(Box<Type>),
+    Map(Box<Type>, Box<Type>),
+    OrderedMap(Box<Type>, Box<Type>),
     Named(String),
     Ref {
         region: Option<String>,
@@ -258,6 +260,7 @@ impl<'a> Checker<'a> {
                     declared_return: sig.return_type.clone(),
                     used_effects: EffectSet::default(),
                     current_function: function.name.clone(),
+                    deterministic_context: sig.attrs.iter().any(|a| a == "deterministic"),
                     loop_depth: 0,
                 };
 
@@ -316,6 +319,7 @@ impl<'a> Checker<'a> {
         match syntax {
             TypeSyntax::Void => Type::Void,
             TypeSyntax::Named(name) => lower_named_type(name),
+            TypeSyntax::Generic { name, args } => lower_generic_type(name, args, |arg| self.lower_type(arg)),
             TypeSyntax::Ref {
                 region,
                 mutable,
@@ -341,6 +345,7 @@ struct FunctionChecker<'a> {
     declared_return: Type,
     used_effects: EffectSet,
     current_function: String,
+    deterministic_context: bool,
     loop_depth: usize,
 }
 
@@ -741,8 +746,6 @@ impl<'a> FunctionChecker<'a> {
         arg_types: &[Type],
         span: Span,
     ) -> Option<Type> {
-        let vec_i64 = Type::Vec(Box::new(Type::I64));
-
         match (module_name, field) {
             ("io", "out") => {
                 if arg_types.len() != 1 {
@@ -809,6 +812,86 @@ impl<'a> FunctionChecker<'a> {
 
                 Some(Type::I64)
             }
+            ("str", "contains") | ("str", "starts_with") | ("str", "ends_with") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM057",
+                        format!("str.{} expects exactly two string arguments", field),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] != Type::Str || arg_types[1] != Type::Str {
+                    self.diagnostics.error(
+                        "SEM057",
+                        format!("str.{} arguments must both be of type str", field),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::Bool)
+            }
+            ("str", "find") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM057",
+                        "str.find expects exactly two string arguments",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] != Type::Str || arg_types[1] != Type::Str {
+                    self.diagnostics.error(
+                        "SEM057",
+                        "str.find arguments must both be of type str",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::I64)
+            }
+            ("str", "slice") => {
+                if arg_types.len() != 3 {
+                    self.diagnostics.error(
+                        "SEM057",
+                        "str.slice expects arguments (str, start, len)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if arg_types[0] != Type::Str
+                    || !arg_types[1].is_integral()
+                    || !arg_types[2].is_integral()
+                {
+                    self.diagnostics.error(
+                        "SEM057",
+                        "str.slice expects arguments (str, integral start, integral len)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                self.used_effects.add_effect("alloc");
+                Some(Type::Str)
+            }
+            ("vec", "new") => {
+                if !arg_types.is_empty() {
+                    self.diagnostics.error(
+                        "SEM038",
+                        "vec.new expects no arguments",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                self.used_effects.add_effect("alloc");
+                Some(Type::Vec(Box::new(Type::Unknown)))
+            }
             ("vec", "new_i64") => {
                 if !arg_types.is_empty() {
                     self.diagnostics.error(
@@ -820,44 +903,104 @@ impl<'a> FunctionChecker<'a> {
                 }
 
                 self.used_effects.add_effect("alloc");
-                Some(vec_i64)
+                Some(Type::Vec(Box::new(Type::I64)))
             }
-            ("vec", "push") => {
-                if arg_types.len() != 2 {
+            ("vec", "with_capacity") => {
+                if arg_types.len() != 1 || !arg_types[0].is_integral() {
                     self.diagnostics.error(
-                        "SEM039",
-                        "vec.push expects arguments (vec_i64, i64)",
-                        Some(span),
-                    );
-                    return Some(Type::Unknown);
-                }
-
-                if arg_types[0] != vec_i64 || arg_types[1] != Type::I64 {
-                    self.diagnostics.error(
-                        "SEM039",
-                        "vec.push expects arguments (vec_i64, i64)",
+                        "SEM038",
+                        "vec.with_capacity expects one integral capacity argument",
                         Some(span),
                     );
                     return Some(Type::Unknown);
                 }
 
                 self.used_effects.add_effect("alloc");
-                Some(vec_i64)
+                Some(Type::Vec(Box::new(Type::Unknown)))
             }
-            ("vec", "get") => {
+            ("vec", "push") => {
                 if arg_types.len() != 2 {
                     self.diagnostics.error(
-                        "SEM055",
-                        "vec.get expects arguments (vec_i64, index)",
+                        "SEM039",
+                        "vec.push expects arguments (vec<T>, T)",
                         Some(span),
                     );
                     return Some(Type::Unknown);
                 }
 
-                if arg_types[0] != vec_i64 || !arg_types[1].is_integral() {
+                let Type::Vec(inner) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM039",
+                        "vec.push first argument must be vec<T>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                let resolved_elem_ty = if is_unknown_type(inner.as_ref()) {
+                    arg_types[1].clone()
+                } else if self.is_assignable(inner.as_ref(), &arg_types[1]) {
+                    inner.as_ref().clone()
+                } else {
+                    self.diagnostics.error(
+                        "SEM039",
+                        format!(
+                            "vec.push element type mismatch: vec<{:?}> cannot accept {:?}",
+                            inner,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                self.used_effects.add_effect("alloc");
+                Some(Type::Vec(Box::new(resolved_elem_ty)))
+            }
+            ("vec", "get") => {
+                if arg_types.len() != 2 {
                     self.diagnostics.error(
                         "SEM055",
-                        "vec.get expects arguments (vec_i64, integral index)",
+                        "vec.get expects arguments (vec<T>, index)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if !arg_types[1].is_integral() {
+                    self.diagnostics.error(
+                        "SEM055",
+                        "vec.get expects an integral index",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::Vec(inner) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM055",
+                        "vec.get first argument must be vec<T>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                Some(inner.as_ref().clone())
+            }
+            ("vec", "len") => {
+                if arg_types.len() != 1 {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.len expects exactly one vec<T> argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                if !matches!(&arg_types[0], Type::Vec(_)) {
+                    self.diagnostics.error(
+                        "SEM056",
+                        "vec.len expects exactly one vec<T> argument",
                         Some(span),
                     );
                     return Some(Type::Unknown);
@@ -865,20 +1008,344 @@ impl<'a> FunctionChecker<'a> {
 
                 Some(Type::I64)
             }
-            ("vec", "len") => {
-                if arg_types.len() != 1 {
+            ("map", _) if self.deterministic_context => {
+                self.diagnostics.error(
+                    "SEM058",
+                    "map<K, V> is not allowed in deterministic contexts; use ordered_map<K, V>",
+                    Some(span),
+                );
+                Some(Type::Unknown)
+            }
+            ("map", "new") => {
+                if !arg_types.is_empty() {
+                    self.diagnostics.error("SEM059", "map.new expects no arguments", Some(span));
+                    return Some(Type::Unknown);
+                }
+                self.used_effects.add_effect("alloc");
+                Some(Type::Map(Box::new(Type::Unknown), Box::new(Type::Unknown)))
+            }
+            ("map", "with_capacity") => {
+                if arg_types.len() != 1 || !arg_types[0].is_integral() {
                     self.diagnostics.error(
-                        "SEM056",
-                        "vec.len expects exactly one vec_i64 argument",
+                        "SEM059",
+                        "map.with_capacity expects one integral capacity argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+                self.used_effects.add_effect("alloc");
+                Some(Type::Map(Box::new(Type::Unknown), Box::new(Type::Unknown)))
+            }
+            ("map", "put") => {
+                if arg_types.len() != 3 {
+                    self.diagnostics.error(
+                        "SEM060",
+                        "map.put expects arguments (map<K, V>, K, V)",
                         Some(span),
                     );
                     return Some(Type::Unknown);
                 }
 
-                if arg_types[0] != vec_i64 {
+                let Type::Map(key_ty, value_ty) = &arg_types[0] else {
                     self.diagnostics.error(
-                        "SEM056",
-                        "vec.len expects exactly one vec_i64 argument",
+                        "SEM060",
+                        "map.put first argument must be map<K, V>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                let resolved_key_ty = if is_unknown_type(key_ty.as_ref()) {
+                    arg_types[1].clone()
+                } else if self.is_assignable(key_ty.as_ref(), &arg_types[1]) {
+                    key_ty.as_ref().clone()
+                } else {
+                    self.diagnostics.error(
+                        "SEM060",
+                        format!(
+                            "map.put key type mismatch: map<{:?}, _> cannot accept {:?}",
+                            key_ty,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                if !is_unknown_type(&resolved_key_ty) && !is_hashable_map_key_type(&resolved_key_ty) {
+                    self.diagnostics.error(
+                        "SEM060",
+                        format!(
+                            "map<K, V> key type {:?} is not currently hashable",
+                            resolved_key_ty
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let resolved_value_ty = if is_unknown_type(value_ty.as_ref()) {
+                    arg_types[2].clone()
+                } else if self.is_assignable(value_ty.as_ref(), &arg_types[2]) {
+                    value_ty.as_ref().clone()
+                } else {
+                    self.diagnostics.error(
+                        "SEM060",
+                        format!(
+                            "map.put value type mismatch: map<_, {:?}> cannot accept {:?}",
+                            value_ty,
+                            arg_types[2]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                self.used_effects.add_effect("alloc");
+                Some(Type::Map(
+                    Box::new(resolved_key_ty),
+                    Box::new(resolved_value_ty),
+                ))
+            }
+            ("map", "get") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM061",
+                        "map.get expects arguments (map<K, V>, K)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::Map(key_ty, value_ty) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM061",
+                        "map.get first argument must be map<K, V>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                if !is_unknown_type(key_ty.as_ref()) && !self.is_assignable(key_ty.as_ref(), &arg_types[1]) {
+                    self.diagnostics.error(
+                        "SEM061",
+                        format!(
+                            "map.get key type mismatch: expected {:?}, got {:?}",
+                            key_ty,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(value_ty.as_ref().clone())
+            }
+            ("map", "contains") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM062",
+                        "map.contains expects arguments (map<K, V>, K)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::Map(key_ty, _) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM062",
+                        "map.contains first argument must be map<K, V>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                if !is_unknown_type(key_ty.as_ref()) && !self.is_assignable(key_ty.as_ref(), &arg_types[1]) {
+                    self.diagnostics.error(
+                        "SEM062",
+                        format!(
+                            "map.contains key type mismatch: expected {:?}, got {:?}",
+                            key_ty,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::Bool)
+            }
+            ("map", "len") => {
+                if arg_types.len() != 1 || !matches!(&arg_types[0], Type::Map(_, _)) {
+                    self.diagnostics.error(
+                        "SEM063",
+                        "map.len expects one map<K, V> argument",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::I64)
+            }
+            ("ordered_map", "new") => {
+                if !arg_types.is_empty() {
+                    self.diagnostics.error(
+                        "SEM064",
+                        "ordered_map.new expects no arguments",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+                self.used_effects.add_effect("alloc");
+                Some(Type::OrderedMap(
+                    Box::new(Type::Unknown),
+                    Box::new(Type::Unknown),
+                ))
+            }
+            ("ordered_map", "put") => {
+                if arg_types.len() != 3 {
+                    self.diagnostics.error(
+                        "SEM065",
+                        "ordered_map.put expects arguments (ordered_map<K, V>, K, V)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::OrderedMap(key_ty, value_ty) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM065",
+                        "ordered_map.put first argument must be ordered_map<K, V>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                let resolved_key_ty = if is_unknown_type(key_ty.as_ref()) {
+                    arg_types[1].clone()
+                } else if self.is_assignable(key_ty.as_ref(), &arg_types[1]) {
+                    key_ty.as_ref().clone()
+                } else {
+                    self.diagnostics.error(
+                        "SEM065",
+                        format!(
+                            "ordered_map.put key type mismatch: ordered_map<{:?}, _> cannot accept {:?}",
+                            key_ty,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                if !is_unknown_type(&resolved_key_ty) && !is_orderable_map_key_type(&resolved_key_ty) {
+                    self.diagnostics.error(
+                        "SEM065",
+                        format!(
+                            "ordered_map<K, V> key type {:?} is not currently orderable",
+                            resolved_key_ty
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let resolved_value_ty = if is_unknown_type(value_ty.as_ref()) {
+                    arg_types[2].clone()
+                } else if self.is_assignable(value_ty.as_ref(), &arg_types[2]) {
+                    value_ty.as_ref().clone()
+                } else {
+                    self.diagnostics.error(
+                        "SEM065",
+                        format!(
+                            "ordered_map.put value type mismatch: ordered_map<_, {:?}> cannot accept {:?}",
+                            value_ty,
+                            arg_types[2]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                self.used_effects.add_effect("alloc");
+                Some(Type::OrderedMap(
+                    Box::new(resolved_key_ty),
+                    Box::new(resolved_value_ty),
+                ))
+            }
+            ("ordered_map", "get") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM066",
+                        "ordered_map.get expects arguments (ordered_map<K, V>, K)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::OrderedMap(key_ty, value_ty) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM066",
+                        "ordered_map.get first argument must be ordered_map<K, V>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                if !is_unknown_type(key_ty.as_ref()) && !self.is_assignable(key_ty.as_ref(), &arg_types[1]) {
+                    self.diagnostics.error(
+                        "SEM066",
+                        format!(
+                            "ordered_map.get key type mismatch: expected {:?}, got {:?}",
+                            key_ty,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(value_ty.as_ref().clone())
+            }
+            ("ordered_map", "contains") => {
+                if arg_types.len() != 2 {
+                    self.diagnostics.error(
+                        "SEM067",
+                        "ordered_map.contains expects arguments (ordered_map<K, V>, K)",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                let Type::OrderedMap(key_ty, _) = &arg_types[0] else {
+                    self.diagnostics.error(
+                        "SEM067",
+                        "ordered_map.contains first argument must be ordered_map<K, V>",
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                };
+
+                if !is_unknown_type(key_ty.as_ref()) && !self.is_assignable(key_ty.as_ref(), &arg_types[1]) {
+                    self.diagnostics.error(
+                        "SEM067",
+                        format!(
+                            "ordered_map.contains key type mismatch: expected {:?}, got {:?}",
+                            key_ty,
+                            arg_types[1]
+                        ),
+                        Some(span),
+                    );
+                    return Some(Type::Unknown);
+                }
+
+                Some(Type::Bool)
+            }
+            ("ordered_map", "len") => {
+                if arg_types.len() != 1 || !matches!(&arg_types[0], Type::OrderedMap(_, _)) {
+                    self.diagnostics.error(
+                        "SEM068",
+                        "ordered_map.len expects one ordered_map<K, V> argument",
                         Some(span),
                     );
                     return Some(Type::Unknown);
@@ -1050,7 +1517,53 @@ impl<'a> FunctionChecker<'a> {
     }
 
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
-        expected == actual || *expected == Type::Unknown || *actual == Type::Unknown
+        match (expected, actual) {
+            (Type::Unknown, _) | (_, Type::Unknown) => true,
+            (Type::Vec(expected_inner), Type::Vec(actual_inner)) => {
+                self.is_assignable(expected_inner, actual_inner)
+            }
+            (Type::Map(expected_k, expected_v), Type::Map(actual_k, actual_v)) => {
+                self.is_assignable(expected_k, actual_k) && self.is_assignable(expected_v, actual_v)
+            }
+            (
+                Type::OrderedMap(expected_k, expected_v),
+                Type::OrderedMap(actual_k, actual_v),
+            ) => {
+                self.is_assignable(expected_k, actual_k) && self.is_assignable(expected_v, actual_v)
+            }
+            (
+                Type::Array {
+                    inner: expected_inner,
+                    size: expected_size,
+                },
+                Type::Array {
+                    inner: actual_inner,
+                    size: actual_size,
+                },
+            ) => {
+                (expected_size == actual_size
+                    || expected_size.is_none()
+                    || actual_size.is_none())
+                    && self.is_assignable(expected_inner, actual_inner)
+            }
+            (
+                Type::Ref {
+                    region: expected_region,
+                    mutable: expected_mutable,
+                    inner: expected_inner,
+                },
+                Type::Ref {
+                    region: actual_region,
+                    mutable: actual_mutable,
+                    inner: actual_inner,
+                },
+            ) => {
+                expected_region == actual_region
+                    && expected_mutable == actual_mutable
+                    && self.is_assignable(expected_inner, actual_inner)
+            }
+            _ => expected == actual,
+        }
     }
 }
 
@@ -1066,15 +1579,48 @@ fn lower_named_type(name: &str) -> Type {
         "f64" => Type::F64,
         "f32" => Type::F32,
         "str" => Type::Str,
+        "vec" => Type::Vec(Box::new(Type::Unknown)),
+        "map" => Type::Map(Box::new(Type::Unknown), Box::new(Type::Unknown)),
+        "ordered_map" => Type::OrderedMap(Box::new(Type::Unknown), Box::new(Type::Unknown)),
         "vec_i64" => Type::Vec(Box::new(Type::I64)),
         _ => Type::Named(name.to_string()),
     }
+}
+
+fn lower_generic_type<F>(name: &str, args: &[TypeSyntax], mut lower: F) -> Type
+where
+    F: FnMut(&TypeSyntax) -> Type,
+{
+    match name {
+        "vec" if args.len() == 1 => Type::Vec(Box::new(lower(&args[0]))),
+        "map" if args.len() == 2 => Type::Map(Box::new(lower(&args[0])), Box::new(lower(&args[1]))),
+        "ordered_map" if args.len() == 2 => {
+            Type::OrderedMap(Box::new(lower(&args[0])), Box::new(lower(&args[1])))
+        }
+        _ => Type::Unknown,
+    }
+}
+
+fn is_unknown_type(ty: &Type) -> bool {
+    matches!(ty, Type::Unknown)
+}
+
+fn is_hashable_map_key_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Bool | Type::I64 | Type::I32 | Type::I8 | Type::U64 | Type::U32 | Type::Str
+    )
+}
+
+fn is_orderable_map_key_type(ty: &Type) -> bool {
+    is_hashable_map_key_type(ty)
 }
 
 fn lower_type_no_ctx(syntax: &TypeSyntax) -> Type {
     match syntax {
         TypeSyntax::Void => Type::Void,
         TypeSyntax::Named(name) => lower_named_type(name),
+        TypeSyntax::Generic { name, args } => lower_generic_type(name, args, lower_type_no_ctx),
         TypeSyntax::Ref {
             region,
             mutable,
@@ -1179,5 +1725,29 @@ fn bad() -> void
         assert!(sema_diags.has_errors());
         assert!(sema_diags.iter().any(|diag| diag.code == "SEM016"));
         assert!(sema_diags.iter().any(|diag| diag.code == "SEM017"));
+    }
+
+    #[test]
+    fn rejects_hash_map_in_deterministic_context() {
+        let src = r#"
+@deterministic
+fn stable() -> i64
+    effects(alloc)
+{
+    let m: map<str, i64> = map.new()
+    m = map.put(m, "x", 1)
+    return map.get(m, "x")
+}
+"#;
+
+        let (tokens, lex_diags) = lexer::lex(0, src);
+        assert!(!lex_diags.has_errors());
+
+        let (module, parse_diags) = parser::parse(tokens);
+        assert!(!parse_diags.has_errors());
+
+        let (_, sema_diags) = check(&module);
+        assert!(sema_diags.has_errors());
+        assert!(sema_diags.iter().any(|diag| diag.code == "SEM058"));
     }
 }

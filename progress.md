@@ -18,9 +18,12 @@ Verified commands:
 
 Observed `run` output for `examples/run_showcase.sable`:
 - `Hello, Sable`
+- `true`
+- `Hello`
 - `2`
 - `10`
-- `program returned: 10`
+- `2`
+- `program returned: 12`
 
 ## Implemented So Far
 
@@ -41,16 +44,21 @@ Observed `run` output for `examples/run_showcase.sable`:
 - Struct field-order/index metadata for deterministic downstream lowering.
 - Builtin member-call typing and effects for:
   - `io.out`
-  - `str.concat`, `str.len`
-  - `vec.new_i64`, `vec.push`, `vec.get`, `vec.len`
+  - `str.concat`, `str.len`, `str.contains`, `str.starts_with`, `str.ends_with`, `str.find`, `str.slice`
+  - `vec.new`, `vec.with_capacity`, `vec.push`, `vec.get`, `vec.len`
+  - `map.new`, `map.with_capacity`, `map.put`, `map.get`, `map.contains`, `map.len`
+  - `ordered_map.new`, `ordered_map.put`, `ordered_map.get`, `ordered_map.contains`, `ordered_map.len`
 - String `+` typing support.
-- Vector indexing typing support (`vec_i64[index]`).
+- Vector indexing typing support (`vec<T>[index]`).
+- Generic type syntax support in declarations: `vec<T>`, `map<K, V>`, `ordered_map<K, V>`.
+- Deterministic-context guardrail:
+  - direct `map<K, V>` usage is rejected in `@deterministic` functions in favor of `ordered_map<K, V>`.
 
 ### 4. MIR Lowering and Optimization
 - CFG-based typed MIR lowering for expressions/control flow.
 - `for` lowering over fixed-size arrays via index loops (`IndexLoad`).
 - Struct metadata (`MirStruct`) propagated into MIR program.
-- Builtin call resolution expanded for `io`, `str`, and `vec` runtime intrinsics.
+- Builtin call resolution expanded for `io`, `str`, `vec`, `map`, and `ordered_map` runtime intrinsics.
 - String constant folding for `+`, `==`, `!=`.
 - Default local init for `str` now emits empty string constant.
 
@@ -59,8 +67,10 @@ Observed `run` output for `examples/run_showcase.sable`:
 - New CLI command: `run <file.sable>`.
 - Runtime builtins implemented:
   - `io.out`
-  - `str.concat`, `str.len`
-  - `vec.new_i64`, `vec.push`, `vec.get`, `vec.len`
+  - `str.concat`, `str.len`, `str.contains`, `str.starts_with`, `str.ends_with`, `str.find`, `str.slice`
+  - `vec.new`, `vec.with_capacity`, `vec.push`, `vec.get`, `vec.len`
+  - `map.new`, `map.with_capacity`, `map.put`, `map.get`, `map.contains`, `map.len`
+  - `ordered_map.new`, `ordered_map.put`, `ordered_map.get`, `ordered_map.contains`, `ordered_map.len`
 - Runtime unit test added and passing.
 
 ### 6. LLVM Codegen (Windows)
@@ -82,19 +92,20 @@ Observed `run` output for `examples/run_showcase.sable`:
 
 ## Remaining Gaps (Major)
 
-- Collections are still narrow: only `vec_i64` exists (no generic `vec<T>` yet).
-- String library is still minimal (`concat`, `len`, `+` typing/folding only).
+- Generic collection inference is still partial: `vec.new()` / `map.new()` / `ordered_map.new()` may still require annotated target types in some flows.
+- Collection key support is intentionally narrow for now (`bool`, integral, `str`) until broader hash/ordering semantics are finalized.
 - LLVM backend does not yet lower full runtime-backed string/vector semantics.
+- LLVM backend does not yet lower runtime-backed map/ordered_map operations.
 - Aggregate store/reference-heavy codegen paths still partial.
 - Borrow checker, region checker, and full determinism checker are not yet implemented.
 - `try/catch` is still not lowered end-to-end.
 
 ## Logical Next Steps
 
-1. Generalize vectors from `vec_i64` to `vec<T>` in type system + sema + MIR + runtime.
-2. Expand string API (slice/substr, contains/find, comparisons, conversions) with effect/type rules and tests.
-3. Implement integration tests for CLI `run` command using example programs.
-4. Continue LLVM parity by lowering runtime-compatible string/vector operations to IR (or explicit runtime calls).
+1. Add deeper generic inference so collection constructor calls infer `T`, `K`, and `V` without mandatory annotations.
+2. Expand collection APIs (`remove`, `clear`, iteration primitives) with determinism-aware restrictions.
+3. Implement integration tests for CLI `run` command using map/ordered_map/string-heavy programs.
+4. Continue LLVM parity by lowering runtime-compatible string/vector/map operations to IR (or explicit runtime calls).
 5. Complete aggregate stores and ref-based aggregate access in backend.
 
 ## Near-Term Milestone

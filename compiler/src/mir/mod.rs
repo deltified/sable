@@ -1159,6 +1159,36 @@ impl<'a> MirLowerer<'a> {
                 }
                 Some(Type::I64)
             }
+            "str.contains" | "str.starts_with" | "str.ends_with" => {
+                if args.len() != 2 || args[0].ty != Type::Str || args[1].ty != Type::Str {
+                    bail!("{} expects two str arguments", callee);
+                }
+                Some(Type::Bool)
+            }
+            "str.find" => {
+                if args.len() != 2 || args[0].ty != Type::Str || args[1].ty != Type::Str {
+                    bail!("str.find expects two str arguments");
+                }
+                Some(Type::I64)
+            }
+            "str.slice" => {
+                if args.len() != 3
+                    || args[0].ty != Type::Str
+                    || !is_integral_type(&args[1].ty)
+                    || !is_integral_type(&args[2].ty)
+                {
+                    bail!("str.slice expects (str, integral start, integral len)");
+                }
+                effects.insert("alloc".to_string());
+                Some(Type::Str)
+            }
+            "vec.new" => {
+                if !args.is_empty() {
+                    bail!("vec.new expects no arguments");
+                }
+                effects.insert("alloc".to_string());
+                Some(Type::Vec(Box::new(Type::Unknown)))
+            }
             "vec.new_i64" => {
                 if !args.is_empty() {
                     bail!("vec.new_i64 expects no arguments");
@@ -1166,25 +1196,260 @@ impl<'a> MirLowerer<'a> {
                 effects.insert("alloc".to_string());
                 Some(Type::Vec(Box::new(Type::I64)))
             }
-            "vec.push" => {
-                if args.len() != 2 || !is_vec_i64_type(&args[0].ty) || args[1].ty != Type::I64 {
-                    bail!("vec.push expects (vec_i64, i64)");
+            "vec.with_capacity" => {
+                if args.len() != 1 || !is_integral_type(&args[0].ty) {
+                    bail!("vec.with_capacity expects one integral capacity argument");
                 }
                 effects.insert("alloc".to_string());
-                Some(Type::Vec(Box::new(Type::I64)))
+                Some(Type::Vec(Box::new(Type::Unknown)))
+            }
+            "vec.push" => {
+                if args.len() != 2 {
+                    bail!("vec.push expects (vec<T>, T)");
+                }
+
+                let Type::Vec(inner) = &args[0].ty else {
+                    bail!("vec.push first argument must be vec<T>");
+                };
+
+                let resolved_elem_ty = if is_unknown_type(inner.as_ref()) {
+                    args[1].ty.clone()
+                } else if is_assignable_type(inner.as_ref(), &args[1].ty) {
+                    inner.as_ref().clone()
+                } else {
+                    bail!(
+                        "vec.push element type mismatch: vec<{:?}> cannot accept {:?}",
+                        inner,
+                        args[1].ty
+                    );
+                };
+
+                effects.insert("alloc".to_string());
+                Some(Type::Vec(Box::new(resolved_elem_ty)))
             }
             "vec.get" => {
                 if args.len() != 2
-                    || !is_vec_i64_type(&args[0].ty)
                     || !is_integral_type(&args[1].ty)
                 {
-                    bail!("vec.get expects (vec_i64, integral index)");
+                    bail!("vec.get expects (vec<T>, integral index)");
+                }
+
+                let Type::Vec(inner) = &args[0].ty else {
+                    bail!("vec.get first argument must be vec<T>");
+                };
+                Some(inner.as_ref().clone())
+            }
+            "vec.len" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::Vec(_)) {
+                    bail!("vec.len expects one vec<T> argument");
                 }
                 Some(Type::I64)
             }
-            "vec.len" => {
-                if args.len() != 1 || !is_vec_i64_type(&args[0].ty) {
-                    bail!("vec.len expects one vec_i64 argument");
+            "map.new" => {
+                if !args.is_empty() {
+                    bail!("map.new expects no arguments");
+                }
+                effects.insert("alloc".to_string());
+                Some(Type::Map(Box::new(Type::Unknown), Box::new(Type::Unknown)))
+            }
+            "map.with_capacity" => {
+                if args.len() != 1 || !is_integral_type(&args[0].ty) {
+                    bail!("map.with_capacity expects one integral capacity argument");
+                }
+                effects.insert("alloc".to_string());
+                Some(Type::Map(Box::new(Type::Unknown), Box::new(Type::Unknown)))
+            }
+            "map.put" => {
+                if args.len() != 3 {
+                    bail!("map.put expects (map<K, V>, K, V)");
+                }
+
+                let Type::Map(key_ty, value_ty) = &args[0].ty else {
+                    bail!("map.put first argument must be map<K, V>");
+                };
+
+                let resolved_key_ty = if is_unknown_type(key_ty.as_ref()) {
+                    args[1].ty.clone()
+                } else if is_assignable_type(key_ty.as_ref(), &args[1].ty) {
+                    key_ty.as_ref().clone()
+                } else {
+                    bail!(
+                        "map.put key type mismatch: map<{:?}, _> cannot accept {:?}",
+                        key_ty,
+                        args[1].ty
+                    );
+                };
+
+                if !is_unknown_type(&resolved_key_ty) && !is_hashable_map_key_type(&resolved_key_ty)
+                {
+                    bail!("map<K, V> key type {:?} is not currently hashable", resolved_key_ty);
+                }
+
+                let resolved_value_ty = if is_unknown_type(value_ty.as_ref()) {
+                    args[2].ty.clone()
+                } else if is_assignable_type(value_ty.as_ref(), &args[2].ty) {
+                    value_ty.as_ref().clone()
+                } else {
+                    bail!(
+                        "map.put value type mismatch: map<_, {:?}> cannot accept {:?}",
+                        value_ty,
+                        args[2].ty
+                    );
+                };
+
+                effects.insert("alloc".to_string());
+                Some(Type::Map(
+                    Box::new(resolved_key_ty),
+                    Box::new(resolved_value_ty),
+                ))
+            }
+            "map.get" => {
+                if args.len() != 2 {
+                    bail!("map.get expects (map<K, V>, K)");
+                }
+
+                let Type::Map(key_ty, value_ty) = &args[0].ty else {
+                    bail!("map.get first argument must be map<K, V>");
+                };
+
+                if !is_unknown_type(key_ty.as_ref()) && !is_assignable_type(key_ty.as_ref(), &args[1].ty)
+                {
+                    bail!(
+                        "map.get key type mismatch: expected {:?}, got {:?}",
+                        key_ty,
+                        args[1].ty
+                    );
+                }
+
+                Some(value_ty.as_ref().clone())
+            }
+            "map.contains" => {
+                if args.len() != 2 {
+                    bail!("map.contains expects (map<K, V>, K)");
+                }
+
+                let Type::Map(key_ty, _) = &args[0].ty else {
+                    bail!("map.contains first argument must be map<K, V>");
+                };
+
+                if !is_unknown_type(key_ty.as_ref()) && !is_assignable_type(key_ty.as_ref(), &args[1].ty)
+                {
+                    bail!(
+                        "map.contains key type mismatch: expected {:?}, got {:?}",
+                        key_ty,
+                        args[1].ty
+                    );
+                }
+
+                Some(Type::Bool)
+            }
+            "map.len" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::Map(_, _)) {
+                    bail!("map.len expects one map<K, V> argument");
+                }
+                Some(Type::I64)
+            }
+            "ordered_map.new" => {
+                if !args.is_empty() {
+                    bail!("ordered_map.new expects no arguments");
+                }
+                effects.insert("alloc".to_string());
+                Some(Type::OrderedMap(
+                    Box::new(Type::Unknown),
+                    Box::new(Type::Unknown),
+                ))
+            }
+            "ordered_map.put" => {
+                if args.len() != 3 {
+                    bail!("ordered_map.put expects (ordered_map<K, V>, K, V)");
+                }
+
+                let Type::OrderedMap(key_ty, value_ty) = &args[0].ty else {
+                    bail!("ordered_map.put first argument must be ordered_map<K, V>");
+                };
+
+                let resolved_key_ty = if is_unknown_type(key_ty.as_ref()) {
+                    args[1].ty.clone()
+                } else if is_assignable_type(key_ty.as_ref(), &args[1].ty) {
+                    key_ty.as_ref().clone()
+                } else {
+                    bail!(
+                        "ordered_map.put key type mismatch: ordered_map<{:?}, _> cannot accept {:?}",
+                        key_ty,
+                        args[1].ty
+                    );
+                };
+
+                if !is_unknown_type(&resolved_key_ty)
+                    && !is_orderable_map_key_type(&resolved_key_ty)
+                {
+                    bail!(
+                        "ordered_map<K, V> key type {:?} is not currently orderable",
+                        resolved_key_ty
+                    );
+                }
+
+                let resolved_value_ty = if is_unknown_type(value_ty.as_ref()) {
+                    args[2].ty.clone()
+                } else if is_assignable_type(value_ty.as_ref(), &args[2].ty) {
+                    value_ty.as_ref().clone()
+                } else {
+                    bail!(
+                        "ordered_map.put value type mismatch: ordered_map<_, {:?}> cannot accept {:?}",
+                        value_ty,
+                        args[2].ty
+                    );
+                };
+
+                effects.insert("alloc".to_string());
+                Some(Type::OrderedMap(
+                    Box::new(resolved_key_ty),
+                    Box::new(resolved_value_ty),
+                ))
+            }
+            "ordered_map.get" => {
+                if args.len() != 2 {
+                    bail!("ordered_map.get expects (ordered_map<K, V>, K)");
+                }
+
+                let Type::OrderedMap(key_ty, value_ty) = &args[0].ty else {
+                    bail!("ordered_map.get first argument must be ordered_map<K, V>");
+                };
+
+                if !is_unknown_type(key_ty.as_ref()) && !is_assignable_type(key_ty.as_ref(), &args[1].ty)
+                {
+                    bail!(
+                        "ordered_map.get key type mismatch: expected {:?}, got {:?}",
+                        key_ty,
+                        args[1].ty
+                    );
+                }
+
+                Some(value_ty.as_ref().clone())
+            }
+            "ordered_map.contains" => {
+                if args.len() != 2 {
+                    bail!("ordered_map.contains expects (ordered_map<K, V>, K)");
+                }
+
+                let Type::OrderedMap(key_ty, _) = &args[0].ty else {
+                    bail!("ordered_map.contains first argument must be ordered_map<K, V>");
+                };
+
+                if !is_unknown_type(key_ty.as_ref()) && !is_assignable_type(key_ty.as_ref(), &args[1].ty)
+                {
+                    bail!(
+                        "ordered_map.contains key type mismatch: expected {:?}, got {:?}",
+                        key_ty,
+                        args[1].ty
+                    );
+                }
+
+                Some(Type::Bool)
+            }
+            "ordered_map.len" => {
+                if args.len() != 1 || !matches!(args[0].ty, Type::OrderedMap(_, _)) {
+                    bail!("ordered_map.len expects one ordered_map<K, V> argument");
                 }
                 Some(Type::I64)
             }
@@ -1296,6 +1561,7 @@ fn lower_type_syntax_no_ctx(syntax: &TypeSyntax) -> Type {
     match syntax {
         TypeSyntax::Void => Type::Void,
         TypeSyntax::Named(name) => lower_named_type(name),
+        TypeSyntax::Generic { name, args } => lower_generic_type(name, args, lower_type_syntax_no_ctx),
         TypeSyntax::Ref {
             region,
             mutable,
@@ -1324,8 +1590,25 @@ fn lower_named_type(name: &str) -> Type {
         "f64" => Type::F64,
         "f32" => Type::F32,
         "str" => Type::Str,
+        "vec" => Type::Vec(Box::new(Type::Unknown)),
+        "map" => Type::Map(Box::new(Type::Unknown), Box::new(Type::Unknown)),
+        "ordered_map" => Type::OrderedMap(Box::new(Type::Unknown), Box::new(Type::Unknown)),
         "vec_i64" => Type::Vec(Box::new(Type::I64)),
         _ => Type::Named(name.to_string()),
+    }
+}
+
+fn lower_generic_type<F>(name: &str, args: &[TypeSyntax], mut lower: F) -> Type
+where
+    F: FnMut(&TypeSyntax) -> Type,
+{
+    match name {
+        "vec" if args.len() == 1 => Type::Vec(Box::new(lower(&args[0]))),
+        "map" if args.len() == 2 => Type::Map(Box::new(lower(&args[0])), Box::new(lower(&args[1]))),
+        "ordered_map" if args.len() == 2 => {
+            Type::OrderedMap(Box::new(lower(&args[0])), Box::new(lower(&args[1])))
+        }
+        _ => Type::Unknown,
     }
 }
 
@@ -1333,8 +1616,68 @@ fn is_integral_type(ty: &Type) -> bool {
     matches!(ty, Type::I64 | Type::I32 | Type::I8 | Type::U64 | Type::U32)
 }
 
-fn is_vec_i64_type(ty: &Type) -> bool {
-    matches!(ty, Type::Vec(inner) if inner.as_ref() == &Type::I64)
+fn is_unknown_type(ty: &Type) -> bool {
+    matches!(ty, Type::Unknown)
+}
+
+fn is_hashable_map_key_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Bool | Type::I64 | Type::I32 | Type::I8 | Type::U64 | Type::U32 | Type::Str
+    )
+}
+
+fn is_orderable_map_key_type(ty: &Type) -> bool {
+    is_hashable_map_key_type(ty)
+}
+
+fn is_assignable_type(expected: &Type, actual: &Type) -> bool {
+    match (expected, actual) {
+        (Type::Unknown, _) | (_, Type::Unknown) => true,
+        (Type::Vec(expected_inner), Type::Vec(actual_inner)) => {
+            is_assignable_type(expected_inner, actual_inner)
+        }
+        (Type::Map(expected_k, expected_v), Type::Map(actual_k, actual_v)) => {
+            is_assignable_type(expected_k, actual_k) && is_assignable_type(expected_v, actual_v)
+        }
+        (
+            Type::OrderedMap(expected_k, expected_v),
+            Type::OrderedMap(actual_k, actual_v),
+        ) => {
+            is_assignable_type(expected_k, actual_k)
+                && is_assignable_type(expected_v, actual_v)
+        }
+        (
+            Type::Array {
+                inner: expected_inner,
+                size: expected_size,
+            },
+            Type::Array {
+                inner: actual_inner,
+                size: actual_size,
+            },
+        ) => {
+            (expected_size == actual_size || expected_size.is_none() || actual_size.is_none())
+                && is_assignable_type(expected_inner, actual_inner)
+        }
+        (
+            Type::Ref {
+                region: expected_region,
+                mutable: expected_mutable,
+                inner: expected_inner,
+            },
+            Type::Ref {
+                region: actual_region,
+                mutable: actual_mutable,
+                inner: actual_inner,
+            },
+        ) => {
+            expected_region == actual_region
+                && expected_mutable == actual_mutable
+                && is_assignable_type(expected_inner, actual_inner)
+        }
+        _ => expected == actual,
+    }
 }
 
 fn infer_int_type(value: &str) -> Type {
